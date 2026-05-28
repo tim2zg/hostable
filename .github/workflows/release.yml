@@ -16,7 +16,7 @@ jobs:
 
       - name: Build Binary via Docker
         run: |
-          docker build -t hostable-builder backend
+          docker build -f backend/Dockerfile -t hostable-builder .
           docker create --name hostable-extract hostable-builder
           docker cp hostable-extract:/usr/local/bin/hostable hostable-linux-amd64
           docker rm hostable-extract
