@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/api/deploy", post(converter::deploy_lxc_endpoint))
                 .route("/api/db/execute", post(db_execute))
                 .route("/api/db/schema", get(db_schema))
-                .route("/api/ws/logs/:vmid", get(ws_logs_handler))
+                .route("/api/ws/logs/{vmid}", get(ws_logs_handler))
                 .route("/api/catalog", get(get_catalog))
                 .fallback(any(proxy_handler))
                 .with_state(shared_state);
