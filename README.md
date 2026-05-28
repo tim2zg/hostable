@@ -11,19 +11,31 @@ Hostable is an automated deployment manager for Proxmox LXC containers. It seaml
 
 Hostable is designed to run directly on your Proxmox server as a lightweight system daemon. You do not need to compile anything.
 
-To install the Hostable Manager on your Proxmox server, log in to your server as `root` and run:
+### Option 1: Native Proxmox Host Installer
+To install the Hostable Manager automatically on your Proxmox server, log in to your server as `root` and run:
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/tim2zg/hostable/main/install.sh | bash
 ```
 
-### What does the script do?
 The installation script will automatically:
 1. Generate an isolated Proxmox API token (`root@pam!hostable`).
 2. Download the latest Alpine Linux OS template.
 3. Spin up an unprivileged LXC container explicitly for the Hostable Manager.
 4. Download the latest Hostable release binary and inject it into the container along with a default configuration.
 5. Setup the background system daemon.
+
+### Option 2: Install inside an Existing LXC Container
+If you already have a container and want to run Hostable inside it, log into the container as `root` and run:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/tim2zg/hostable/main/install_in_lxc.sh | bash
+```
+
+This script works on Debian, Ubuntu, and Alpine containers. It will:
+1. Prompt you for your Proxmox API credentials (you must generate these manually in the Proxmox UI).
+2. Download the Hostable binary.
+3. Automatically set up the daemon using either `systemd` or `OpenRC`.
 
 ## Configuration
 
