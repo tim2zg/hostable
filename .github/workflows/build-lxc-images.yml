@@ -1,0 +1,119 @@
+name: Build and Deploy LXC Images
+
+on:
+  schedule:
+    # Run every Sunday at midnight to keep images up to date
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    # Allow manual triggering with custom image parameters
+    inputs:
+      image:
+        description: 'Docker image to pull and convert'
+        required: true
+        default: 'lscr.io/linuxserver/jellyfin:latest'
+      distro:
+        description: 'LXC distribution name'
+        required: true
+        default: 'jellyfin'
+      release:
+        description: 'LXC release name'
+        required: true
+        default: 'latest'
+      push_to_ghcr:
+        description: 'Push container image to GHCR'
+        type: boolean
+        required: true
+        default: true
+
+# Permissions required to publish to GitHub Pages and GHCR
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  packages: write
+
+# Ensure only one deploy runs at a time
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
+jobs:
+  build-and-convert:
+    name: Build & Package LXC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ github.event_name == 'schedule' || inputs.push_to_ghcr == true }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------------
+      # Schedule Build: Run the matrix of standard templates
+      # ------------------------------------------------------------------------
+      - name: Build Standard Templates (Weekly Schedule)
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          chmod +x ./build_lxc.sh
+          
+          # Build Jellyfin
+          ./build_lxc.sh --image lscr.io/linuxserver/jellyfin:latest --distro jellyfin --release latest
+          docker tag lscr.io/linuxserver/jellyfin:latest ghcr.io/${{ github.repository }}/jellyfin:latest
+          docker push ghcr.io/${{ github.repository }}/jellyfin:latest
+
+          # Build Radarr
+          ./build_lxc.sh --image lscr.io/linuxserver/radarr:latest --distro radarr --release latest
+          docker tag lscr.io/linuxserver/radarr:latest ghcr.io/${{ github.repository }}/radarr:latest
+          docker push ghcr.io/${{ github.repository }}/radarr:latest
+
+          # Build Nginx Proxy Manager
+          ./build_lxc.sh --image jc21/nginx-proxy-manager:latest --distro nginx-proxy-manager --release latest
+          docker tag jc21/nginx-proxy-manager:latest ghcr.io/${{ github.repository }}/nginx-proxy-manager:latest
+          docker push ghcr.io/${{ github.repository }}/nginx-proxy-manager:latest
+
+      # ------------------------------------------------------------------------
+      # Manual Build: Run custom user parameters
+      # ------------------------------------------------------------------------
+      - name: Build Custom Template (Manual Trigger)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          chmod +x ./build_lxc.sh
+          ./build_lxc.sh --image "${{ inputs.image }}" --distro "${{ inputs.distro }}" --release "${{ inputs.release }}"
+          
+          if [ "${{ inputs.push_to_ghcr }}" = "true" ]; then
+            # Convert slash/colon in tag to fit GHCR lowercase constraints
+            REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+            TAG_NAME=$(echo "${{ inputs.distro }}" | tr '[:upper:]' '[:lower:]')
+            RELEASE_NAME=$(echo "${{ inputs.release }}" | tr '[:upper:]' '[:lower:]')
+            
+            docker tag "${{ inputs.image }}" "ghcr.io/${REPO_LOWER}/${TAG_NAME}:${RELEASE_NAME}"
+            docker push "ghcr.io/${REPO_LOWER}/${TAG_NAME}:${RELEASE_NAME}"
+          fi
+
+      # ------------------------------------------------------------------------
+      # Upload compiled files for static hosting
+      # ------------------------------------------------------------------------
+      - name: Upload Static Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
+
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    needs: build-and-convert
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages Site
+        id: deployment
+        uses: actions/deploy-pages@v4

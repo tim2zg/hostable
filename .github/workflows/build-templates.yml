@@ -1,0 +1,43 @@
+name: Build and Test Templates
+
+on:
+  push:
+    paths:
+      - 'templates/**'
+      - 'backend/src/converter.rs'
+      - 'backend/src/bin/cli.rs'
+      - '.github/workflows/build-templates.yml'
+  pull_request:
+    paths:
+      - 'templates/**'
+
+jobs:
+  test-templates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Build Hostable CLI
+        working-directory: ./backend
+        run: cargo build --bin cli --release
+
+      - name: Test Conversion of Pi-hole Template
+        run: ./backend/target/release/cli convert --file templates/pihole/Dockerfile
+
+      - name: Test Conversion of Jellyfin Template
+        run: ./backend/target/release/cli convert --file templates/jellyfin/Dockerfile
+
+      - name: Test Conversion of Nginx Proxy Manager Template
+        run: ./backend/target/release/cli convert --file templates/nginx-proxy-manager/Dockerfile
+
+      - name: Success Summary
+        run: echo "✅ All mock templates successfully converted to Distrobuilder YAML!" >> $GITHUB_STEP_SUMMARY

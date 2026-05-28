@@ -1,0 +1,17 @@
+# Rust/Cargo
+/backend/target/
+**/*.rs.bk
+
+# Hostable cache and temporary files
+**/.cache.meta
+**/*.tar.xz
+hostable-linux-amd64
+build.bat
+
+# Sensitive Configs
+.env
+config/
+hostable-manager/
+
+# General
+.DS_Store

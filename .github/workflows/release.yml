@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Binary via Docker
+        run: |
+          docker build -t hostable-builder backend
+          docker create --name hostable-extract hostable-builder
+          docker cp hostable-extract:/usr/local/bin/hostable hostable-linux-amd64
+          docker rm hostable-extract
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: hostable-linux-amd64
+          generate_release_notes: true

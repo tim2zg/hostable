@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS templates (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    original_dockerfile TEXT NOT NULL,
+    generated_yaml TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS containers (
+    id SERIAL PRIMARY KEY,
+    vmid INTEGER UNIQUE NOT NULL,
+    template_id INTEGER REFERENCES templates(id),
+    name VARCHAR(255) NOT NULL,
+    auto_update BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
