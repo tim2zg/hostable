@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { apiGet } from './api';
 
   let stats = {
     cpu: 0,
@@ -8,25 +9,28 @@
     activeLxcs: 0
   };
   let errorMsg = "";
+  let interval: any;
 
   async function fetchStats() {
+    if (document.hidden) return;
     try {
-      const res = await fetch('/api/stats');
-      if (res.ok) {
-        stats = await res.json();
-      } else {
-        errorMsg = "Failed to load real-time node statistics.";
-      }
+      stats = await apiGet('/stats');
+      errorMsg = "";
     } catch (err) {
       console.error(err);
-      errorMsg = "Unable to connect to Proxmox API.";
+      errorMsg = "Unable to connect to Proxmox API or Backend.";
     }
   }
 
   onMount(() => {
     fetchStats();
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
+    interval = setInterval(fetchStats, 5000);
+    document.addEventListener('visibilitychange', fetchStats);
+  });
+
+  onDestroy(() => {
+    clearInterval(interval);
+    document.removeEventListener('visibilitychange', fetchStats);
   });
 </script>
 
@@ -43,54 +47,30 @@
     gap: 1.5rem;
   }
 
-  .flat-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-  }
-
   .flat-card h3 {
     font-size: 1.1rem;
-    color: #cbd5e1;
+    color: var(--text-secondary);
     font-weight: 500;
+    margin-bottom: 1rem;
   }
 
   .stat-value {
     font-size: 2.5rem;
     font-weight: 700;
-    color: #38bdf8;
+    color: var(--primary-color);
+    margin-bottom: 1rem;
   }
 
   .subtitle {
-    color: #4ade80;
+    color: var(--success-color);
     font-size: 0.9rem;
     font-weight: 500;
-  }
-
-  .progress-bar {
-    width: 100%;
-    height: 8px;
-    background: #0f172a;
-    border-radius: 4px;
-    overflow: hidden;
-  }
-
-  .progress-fill {
-    height: 100%;
-    background: #38bdf8;
-    border-radius: 4px;
-    transition: width 0.5s ease-out;
   }
 
   .alert-banner {
     padding: 1rem;
     background: rgba(239, 68, 68, 0.1);
-    border: 1px solid #ef4444;
+    border: 1px solid var(--danger-color);
     color: #f87171;
     border-radius: 6px;
     font-size: 0.95rem;
@@ -99,8 +79,8 @@
 
 <div class="dashboard-container animate-fade-in">
   <div>
-    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Proxmox Cluster Status</h1>
-    <p style="color: #94a3b8; font-size: 1rem;">Real-time cluster resources and active instances.</p>
+    <h1 style="font-size: 2rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">Proxmox Cluster Status</h1>
+    <p style="color: var(--text-secondary); font-size: 1rem;">Real-time cluster resources and active instances.</p>
   </div>
 
   {#if errorMsg}
@@ -120,7 +100,7 @@
       <h3>RAM Usage</h3>
       <div class="stat-value">{stats.ram}%</div>
       <div class="progress-bar">
-        <div class="progress-fill" style="width: {stats.ram}%; background: {stats.ram > 80 ? '#ef4444' : '#38bdf8'}"></div>
+        <div class="progress-fill" style="width: {stats.ram}%; background: {stats.ram > 80 ? 'var(--danger-color)' : 'var(--primary-color)'}"></div>
       </div>
     </div>
 

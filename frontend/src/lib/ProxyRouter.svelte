@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { apiGet, apiPost, apiDelete } from './api';
 
   type ProxyRule = { id?: number, domain: string, target_ip: string, target_port: number, container_id?: number, auth_enabled?: boolean };
   let rules: ProxyRule[] = [];
@@ -11,48 +12,52 @@
 
   let isSubmitting = false;
   let statusMsg = "";
+  let statusError = false;
 
   async function fetchRules() {
     try {
-      const res = await fetch('/api/proxy-rules');
-      if (res.ok) {
-        rules = await res.json();
-      }
+      rules = await apiGet('/proxy-rules');
     } catch (err) {
       console.error(err);
-      // Fallback
-      rules = [
-        { id: 1, domain: "pihole.local", target_ip: "10.0.0.5", target_port: 80, container_id: 103, auth_enabled: false },
-        { id: 2, domain: "jellyfin.local", target_ip: "10.0.0.6", target_port: 8096, container_id: 104, auth_enabled: true },
-      ];
+      statusMsg = "Failed to load proxy rules.";
+      statusError = true;
+      rules = [];
     }
   }
 
   async function addRule() {
     isSubmitting = true;
     statusMsg = "";
+    statusError = false;
     try {
-      const res = await fetch('/api/proxy-rules', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domain: newDomain,
-          target_ip: newIp,
-          target_port: newPort,
-          auth_enabled: newAuthEnabled,
-        })
+      await apiPost('/proxy-rules', {
+        domain: newDomain,
+        target_ip: newIp,
+        target_port: newPort,
+        auth_enabled: newAuthEnabled,
       });
-      if (res.ok) {
-        statusMsg = "Rule added successfully!";
-        rules = [...rules, { domain: newDomain, target_ip: newIp, target_port: newPort, auth_enabled: newAuthEnabled }];
-        newDomain = ""; newIp = ""; newPort = 80; newAuthEnabled = false;
-      } else {
-        statusMsg = "Failed to add rule.";
-      }
+      statusMsg = "Rule added successfully!";
+      statusError = false;
+      newDomain = ""; newIp = ""; newPort = 80; newAuthEnabled = false;
+      await fetchRules();
     } catch (err) {
       statusMsg = "Error: " + err;
+      statusError = true;
     } finally {
       isSubmitting = false;
+    }
+  }
+
+  async function deleteRule(id: number | undefined) {
+    if (!id) return;
+    if (!confirm(`Are you sure you want to delete this rule?`)) return;
+    try {
+      await apiDelete(`/proxy-rules/${id}`);
+      await fetchRules();
+    } catch (err) {
+      console.error(err);
+      statusMsg = "Failed to delete rule.";
+      statusError = true;
     }
   }
 
@@ -62,14 +67,6 @@
 </script>
 
 <style>
-  .flat-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.5rem 2rem;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-  }
-
   .form-grid {
     display: flex;
     gap: 1rem;
@@ -103,28 +100,6 @@
 
   .flat-input:focus {
     border-color: #38bdf8;
-  }
-
-  .flat-btn-primary {
-    background: #38bdf8;
-    border: none;
-    color: #0f172a;
-    border-radius: 6px;
-    padding: 0.6rem 1.5rem;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .flat-btn-primary:hover:not(:disabled) {
-    background: #0ea5e9;
-  }
-
-  .flat-btn-primary:disabled {
-    background: #475569;
-    color: #94a3b8;
-    cursor: not-allowed;
   }
 
   .rules-table {
@@ -201,7 +176,7 @@
       </button>
     </div>
     {#if statusMsg}
-      <div style="margin-top: 1rem; color: #4ade80; font-size: 0.95rem; font-weight: 500;">{statusMsg}</div>
+      <div style="margin-top: 1rem; color: {statusError ? '#f87171' : '#4ade80'}; font-size: 0.95rem; font-weight: 500;">{statusMsg}</div>
     {/if}
   </div>
 
@@ -218,6 +193,7 @@
             <th>LXC Internal Target</th>
             <th>Authelia Zero-Trust</th>
             <th>Status</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -233,6 +209,9 @@
                 {/if}
               </td>
               <td><span style="color: #4ade80; font-weight: 500;">Active</span></td>
+              <td>
+                <button class="flat-btn-danger" style="padding: 0.2rem 0.5rem; font-size: 0.8rem;" on:click={() => deleteRule(rule.id)}>Delete</button>
+              </td>
             </tr>
           {/each}
         </tbody>

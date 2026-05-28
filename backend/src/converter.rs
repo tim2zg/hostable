@@ -13,6 +13,7 @@ pub struct ConvertResponse {
 }
 
 pub async fn convert_dockerfile_endpoint(
+    _auth: crate::RequireAuth,
     Json(payload): Json<ConvertRequest>,
 ) -> impl IntoResponse {
     let yaml = convert_dockerfile_to_distrobuilder(&payload.dockerfile);
@@ -40,6 +41,7 @@ pub struct DeployResponse {
 }
 
 pub async fn deploy_lxc_endpoint(
+    _auth: crate::RequireAuth,
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
     Json(payload): Json<DeployRequest>,
 ) -> impl IntoResponse {
@@ -75,27 +77,33 @@ pub async fn deploy_lxc_endpoint(
     let out_path = cache_dir.join(format!("hostable_vmid_{}.tar.xz", payload.vmid));
     let filename = format!("hostable_vmid_{}.tar.xz", payload.vmid);
     
-    match extractor.extract_to_dir(&payload.image, &out_path).await {
+    match extractor.extract_to_dir(&payload.image, &out_path, Some(&final_envs)).await {
         Ok(_) => {
             // 3. Upload to Proxmox
             match state.proxmox.upload_template(node, &payload.template_storage, &out_path, &filename).await {
                 Ok(_) => {
                     // 4. Create LXC
                     let mut params = std::collections::HashMap::new();
-                    params.insert("vmid", payload.vmid.to_string());
-                    params.insert("ostemplate", format!("{}:vztmpl/{}", payload.template_storage, filename));
-                    params.insert("hostname", payload.hostname.clone());
-                    params.insert("memory", payload.memory.clone());
-                    params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
-                    params.insert("storage", payload.rootfs_storage.clone());
-                    params.insert("rootfs", format!("{}:8", payload.rootfs_storage));
-                    params.insert("tags", "hostable".to_string());
-                    params.insert("unprivileged", "1".to_string());
-                    params.insert("features", "nesting=1".to_string());
+                    params.insert("vmid".to_string(), payload.vmid.to_string());
+                    params.insert("ostemplate".to_string(), format!("{}:vztmpl/{}", payload.template_storage, filename));
+                    params.insert("hostname".to_string(), payload.hostname.clone());
+                    params.insert("memory".to_string(), payload.memory.clone());
+                    params.insert("net0".to_string(), "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                    params.insert("storage".to_string(), payload.rootfs_storage.clone());
+                    params.insert("rootfs".to_string(), format!("{}:8", payload.rootfs_storage));
+                    params.insert("tags".to_string(), "hostable".to_string());
+                    params.insert("unprivileged".to_string(), "1".to_string());
+                    params.insert("features".to_string(), "nesting=1".to_string());
 
-                    // Env formatting (LXC hook) - temporary hack, setting it via Proxmox doesn't perfectly map to OCI ENV easily without modifying the rootfs.
-                    // But we can add them to a file in the rootfs before compression in the future.
-                    // For now, we will just proceed with creating.
+                    // Map Volumes
+                    for (i, vol) in payload.volumes.iter().enumerate() {
+                        let parts: Vec<&str> = vol.split(':').collect();
+                        if parts.len() >= 2 {
+                            let host_path = parts[0];
+                            let container_path = parts[1];
+                            params.insert(format!("mp{}", i), format!("{},mp={}", host_path, container_path));
+                        }
+                    }
 
                     match state.proxmox.create_lxc(node, payload.vmid, params).await {
                         Ok(_) => {

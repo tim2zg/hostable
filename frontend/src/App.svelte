@@ -9,44 +9,37 @@
   import DatabaseManager from './lib/DatabaseManager.svelte';
   import Login from './lib/Login.svelte';
   import Settings from './lib/Settings.svelte';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { apiGet } from './lib/api';
 
   let currentView = 'dashboard';
   let isAuthenticated = false;
   let isChecking = true;
+  let sidebarOpen = false;
+
+  function logout() {
+    localStorage.removeItem('hostable_token');
+    isAuthenticated = false;
+    currentView = 'dashboard';
+  }
 
   onMount(async () => {
+    window.addEventListener('hostable-logout', logout);
     const token = localStorage.getItem('hostable_token');
-    
-    // Setup global fetch interceptor for API calls
-    const originalFetch = window.fetch;
-    window.fetch = async function() {
-      let [resource, config] = arguments;
-      if (typeof resource === 'string' && resource.startsWith('/api/')) {
-        config = config || {};
-        config.headers = config.headers || {};
-        const currentToken = localStorage.getItem('hostable_token');
-        if (currentToken) {
-          config.headers['Authorization'] = `Bearer ${currentToken}`;
-        }
-      }
-      return originalFetch(resource, config);
-    };
-
     if (token) {
       try {
-        const res = await fetch('/api/verify');
-        if (res.ok) {
-          isAuthenticated = true;
-        } else {
-          localStorage.removeItem('hostable_token');
-        }
-      } catch (e) {
-        // Network error, assume token is valid for offline
+        await apiGet('/verify');
         isAuthenticated = true;
+      } catch (e) {
+        localStorage.removeItem('hostable_token');
+        isAuthenticated = false;
       }
     }
     isChecking = false;
+  });
+
+  onDestroy(() => {
+    window.removeEventListener('hostable-logout', logout);
   });
 
   function onLogin() {
@@ -55,75 +48,40 @@
 
   function setView(view: string) {
     currentView = view;
+    sidebarOpen = false;
   }
 </script>
 
 {#if isChecking}
-  <div style="height: 100vh; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); background: #0f172a;">
-    Loading Hostable...
+  <div class="loading-screen">
+    <div class="loading-spinner"></div>
+    <p>Loading Hostable...</p>
   </div>
 {:else if !isAuthenticated}
   <Login on:login={onLogin} />
 {:else}
 <div class="app-layout">
-  <!-- Sidebar -->
-  <aside class="sidebar">
-    <div class="sidebar-brand">
-      Hostable.
-    </div>
+  <button class="mobile-menu-btn" on:click={() => sidebarOpen = !sidebarOpen} aria-label="Toggle menu">
+    {sidebarOpen ? '✕' : '☰'}
+  </button>
+
+  <aside class="sidebar" class:sidebar-open={sidebarOpen}>
+    <div class="sidebar-brand">Hostable.</div>
     <nav>
-      <div 
-        class="nav-item {currentView === 'dashboard' ? 'active' : ''}"
-        on:click={() => setView('dashboard')}
-      >
-        Dashboard
-      </div>
-      <div 
-        class="nav-item {currentView === 'lxc' ? 'active' : ''}"
-        on:click={() => setView('lxc')}
-      >
-        LXC Manager
-      </div>
-      <div 
-        class="nav-item {currentView === 'catalog' ? 'active' : ''}"
-        on:click={() => setView('catalog')}
-      >
-        Catalog (1-Click)
-      </div>
-      <div 
-        class="nav-item {currentView === 'converter' ? 'active' : ''}"
-        on:click={() => setView('converter')}
-      >
-        Custom Deploy
-      </div>
-      <div 
-        class="nav-item {currentView === 'proxy' ? 'active' : ''}"
-        on:click={() => setView('proxy')}
-      >
-        Proxy Routing
-      </div>
-      <div 
-        class="nav-item {currentView === 'logs' ? 'active' : ''}"
-        on:click={() => setView('logs')}
-      >
-        Real-Time Logs
-      </div>
-      <div 
-        class="nav-item {currentView === 'db' ? 'active' : ''}"
-        on:click={() => setView('db')}
-      >
-        DB Provision
-      </div>
-      <div 
-        class="nav-item {currentView === 'settings' ? 'active' : ''}"
-        on:click={() => setView('settings')}
-      >
-        Settings
-      </div>
+      <button class="nav-item {currentView === 'dashboard' ? 'active' : ''}" on:click={() => setView('dashboard')}>📊 Dashboard</button>
+      <button class="nav-item {currentView === 'lxc' ? 'active' : ''}" on:click={() => setView('lxc')}>📦 LXC Manager</button>
+      <button class="nav-item {currentView === 'catalog' ? 'active' : ''}" on:click={() => setView('catalog')}>🛒 Catalog (1-Click)</button>
+      <button class="nav-item {currentView === 'converter' ? 'active' : ''}" on:click={() => setView('converter')}>🐳 Custom Deploy</button>
+      <button class="nav-item {currentView === 'proxy' ? 'active' : ''}" on:click={() => setView('proxy')}>🌐 Proxy Routing</button>
+      <button class="nav-item {currentView === 'logs' ? 'active' : ''}" on:click={() => setView('logs')}>📋 Real-Time Logs</button>
+      <button class="nav-item {currentView === 'db' ? 'active' : ''}" on:click={() => setView('db')}>🗄️ DB Provision</button>
+      <button class="nav-item {currentView === 'settings' ? 'active' : ''}" on:click={() => setView('settings')}>⚙️ Settings</button>
     </nav>
+    <div class="sidebar-footer">
+      <button class="nav-item logout-btn" on:click={logout}>🚪 Logout</button>
+    </div>
   </aside>
 
-  <!-- Main Content -->
   <main class="main-content">
     {#if currentView === 'dashboard'}
       <Dashboard />

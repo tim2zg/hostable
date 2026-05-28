@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { apiGet, apiPost } from './api';
 
   type Lxc = { id: number, name: string, status: string, mem: string, cpu: string, tags: string, type: string };
   let allContainers: Lxc[] = [];
   let containers: Lxc[] = [];
   let isFetching = false;
   let showHostableOnly = true;
+  let searchQuery = '';
 
   // Terminal Console State
   let activeConsoleId: number | null = null;
@@ -17,11 +19,8 @@
   async function fetchContainers() {
     isFetching = true;
     try {
-      const res = await fetch('/api/lxcs');
-      if (res.ok) {
-        allContainers = await res.json();
-        applyFilter();
-      }
+      allContainers = await apiGet('/lxcs');
+      applyFilter();
     } catch (err) {
       console.error("Failed to fetch LXCs", err);
       allContainers = [];
@@ -32,11 +31,15 @@
   }
 
   function applyFilter() {
+    let filtered = allContainers;
     if (showHostableOnly) {
-      containers = allContainers.filter(ct => ct.tags && ct.tags.includes('hostable'));
-    } else {
-      containers = [...allContainers];
+      filtered = filtered.filter(ct => ct.tags && ct.tags.includes('hostable'));
     }
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      filtered = filtered.filter(ct => ct.name.toLowerCase().includes(q) || ct.id.toString().includes(q));
+    }
+    containers = filtered;
   }
 
   function toggleFilter() {
@@ -44,12 +47,33 @@
     applyFilter();
   }
 
+  async function startContainer(id: number) {
+    try {
+      await apiPost(`/lxc/${id}/start`, {});
+      await fetchContainers();
+    } catch(e) { console.error(e); }
+  }
+
+  async function stopContainer(id: number) {
+    if (!confirm(`Are you sure you want to stop container #${id}?`)) return;
+    try {
+      await apiPost(`/lxc/${id}/stop`, {});
+      await fetchContainers();
+    } catch(e) { console.error(e); }
+  }
+
+  async function restartContainer(id: number) {
+    try {
+      await apiPost(`/lxc/${id}/restart`, {});
+      await fetchContainers();
+    } catch(e) { console.error(e); }
+  }
+
   function openConsole(id: number) {
     activeConsoleId = id;
     consoleOutput = "";
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Connect directly to backend Axum WebSocket
-    ws = new WebSocket(`${protocol}//127.0.0.1:3000/api/ws/${id}`);
+    ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/${id}?token=${localStorage.getItem('hostable_token')}`);
     
     ws.onmessage = (event) => {
       consoleOutput += event.data;
@@ -95,14 +119,6 @@
     gap: 1rem;
   }
 
-  .flat-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.5rem 2rem;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-  }
-
   .lxc-header {
     display: flex;
     justify-content: space-between;
@@ -129,38 +145,6 @@
   .actions {
     display: flex;
     gap: 0.5rem;
-  }
-
-  .flat-btn-outline {
-    background: transparent;
-    border: 1px solid #334155;
-    color: #cbd5e1;
-    border-radius: 6px;
-    padding: 0.4rem 0.8rem;
-    font-size: 0.9rem;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-
-  .flat-btn-outline:hover {
-    border-color: #38bdf8;
-    color: #38bdf8;
-  }
-
-  .flat-btn-primary {
-    background: #38bdf8;
-    border: none;
-    color: #0f172a;
-    border-radius: 6px;
-    padding: 0.4rem 0.8rem;
-    font-size: 0.9rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .flat-btn-primary:hover {
-    background: #0ea5e9;
   }
 
   .lxc-stats {
@@ -253,22 +237,54 @@
     font-size: 0.95rem;
     outline: none;
   }
+  
+  .filter-controls {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+  }
+  
+  .search-input {
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: #e2e8f0;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.95rem;
+    outline: none;
+    min-width: 250px;
+  }
+  .search-input:focus {
+    border-color: #38bdf8;
+  }
 </style>
 
 <div class="animate-fade-in">
-  <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2rem;">
+  <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem;">
     <div>
       <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Cluster Instances</h1>
       <p style="color: #94a3b8; font-size: 1rem;">One-click lifecycle management and remote terminal diagnostics.</p>
     </div>
     <div style="display: flex; gap: 1rem;">
-      <button class="flat-btn-outline" on:click={toggleFilter}>
-        {showHostableOnly ? 'Showing: Hostable Only' : 'Showing: All Instances'}
-      </button>
       <button class="flat-btn-primary" on:click={fetchContainers} disabled={isFetching}>
         {isFetching ? 'Refreshing...' : '🔄 Refresh'}
       </button>
     </div>
+  </div>
+
+  <div class="filter-controls">
+    <input 
+      type="text" 
+      class="search-input" 
+      placeholder="Search instances by name or ID..." 
+      bind:value={searchQuery}
+      on:input={applyFilter}
+    />
+    <button class="flat-btn-outline" on:click={toggleFilter}>
+      {showHostableOnly ? 'Showing: Hostable Only' : 'Showing: All Instances'}
+    </button>
   </div>
 
   {#if containers.length === 0 && !isFetching}
@@ -299,11 +315,11 @@
           
           <div class="actions">
             {#if ct.status === 'running'}
-              <button class="flat-btn-outline" title="Stop">⏹ Stop</button>
-              <button class="flat-btn-outline" title="Restart">🔄 Restart</button>
+              <button class="flat-btn-outline" title="Stop" on:click={() => stopContainer(ct.id)}>⏹ Stop</button>
+              <button class="flat-btn-outline" title="Restart" on:click={() => restartContainer(ct.id)}>🔄 Restart</button>
               <button class="flat-btn-primary" title="Console" on:click={() => openConsole(ct.id)}>💻 Console</button>
             {:else}
-              <button class="flat-btn-primary" title="Start">▶ Start</button>
+              <button class="flat-btn-primary" title="Start" on:click={() => startContainer(ct.id)}>▶ Start</button>
             {/if}
           </div>
         </div>

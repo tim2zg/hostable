@@ -16,9 +16,10 @@ impl ProxmoxClient {
         let host = env::var("PROXMOX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let token_id = env::var("PROXMOX_TOKEN_ID").unwrap_or_default();
         let token_secret = env::var("PROXMOX_TOKEN_SECRET").unwrap_or_default();
+        let insecure = env::var("PROXMOX_INSECURE_TLS").unwrap_or_else(|_| "true".to_string()) == "true";
         
         let client = Client::builder()
-            .danger_accept_invalid_certs(true) // Proxmox usually uses self-signed certificates
+            .danger_accept_invalid_certs(insecure)
             .build()
             .expect("Failed to build Proxmox reqwest client");
 
@@ -102,7 +103,7 @@ impl ProxmoxClient {
         res.json().await.map_err(|e| e.to_string())
     }
 
-    pub async fn create_lxc(&self, node: &str, vmid: u32, params: std::collections::HashMap<&str, String>) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn create_lxc(&self, node: &str, vmid: u32, params: std::collections::HashMap<String, String>) -> Result<serde_json::Value, reqwest::Error> {
         let url = format!("{}/nodes/{}/lxc", self.base_url, node);
         
         let res = self.client.post(&url)

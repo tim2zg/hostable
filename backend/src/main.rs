@@ -3,16 +3,16 @@ use std::fs;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use axum::{
-    routing::{get, post, any},
+    routing::{get, post, delete, any},
     Router,
     Json,
     body::Body,
-    http::{Request, Response, StatusCode, request::Parts},
-    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, FromRequestParts, FromRef, State, Path as AxumPath},
+    http::{Request, Response, StatusCode, request::Parts, Method},
+    extract::{FromRequestParts, FromRef, State},
     response::IntoResponse,
 };
-use tokio::time::{interval, Duration};
-use std::time::SystemTime;
+use tower_http::cors::{CorsLayer, Any};
+use tower_http::trace::TraceLayer;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use std::env;
@@ -25,6 +25,7 @@ use rust_embed::RustEmbed;
 mod proxmox;
 mod converter;
 mod oci;
+mod routes;
 
 #[derive(RustEmbed)]
 #[folder = "../frontend/dist/"]
@@ -36,8 +37,6 @@ pub struct AppState {
     pub catalog_cache: tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>,
 }
 
-use sqlx::Row;
-
 #[derive(Parser)]
 #[command(name = "hostable")]
 #[command(about = "Hostable: Native Proxmox Container Manager and Edge Router", long_about = None)]
@@ -48,56 +47,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launches the Hostable Web Application and Reverse Proxy Router
     Start,
-    
-    /// Converts a Dockerfile to distrobuilder YAML format
     Convert {
-        /// Path to the input Dockerfile
         #[arg(short, long, value_name = "FILE")]
         file: PathBuf,
-
-        /// Optional path to save the generated Distrobuilder YAML file
         #[arg(short, long, value_name = "OUT")]
         out: Option<PathBuf>,
     },
-    
-    /// Deploys a Dockerfile directly to Proxmox (simulation)
     Deploy {
-        /// Path to the input Dockerfile
         #[arg(short, long, value_name = "FILE")]
         file: PathBuf,
     },
-    
-    /// Pulls and decompresses a Docker registry OCI image into a native LXC template
     PullDocker {
-        /// Docker image reference (e.g. alpine:latest or linuxserver/jellyfin)
         #[arg(short, long, value_name = "IMAGE")]
         image: String,
-
-        /// Output path for the generated .tar.xz file
         #[arg(short, long, value_name = "OUT")]
         out: PathBuf,
     },
-    
-    /// Checks for a Docker image update and applies it to a specific Proxmox LXC
     UpdateLxc {
-        /// Docker image reference (e.g. alpine:latest)
         #[arg(short, long, value_name = "IMAGE")]
         image: String,
-
-        /// The target Proxmox VMID to update
         #[arg(short, long, value_name = "VMID")]
         vmid: u32,
-        
-        /// Output path for the extracted rootfs .tar.xz file
         #[arg(short, long, value_name = "OUT")]
         out: PathBuf,
     },
-    
-    /// Runs the daemon to continuously update deployments based on a config file
     Manage {
-        /// Path to the config.yaml file
         #[arg(short, long, value_name = "CONFIG")]
         config: PathBuf,
     }
@@ -178,19 +153,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 catalog_cache: tokio::sync::RwLock::new(None),
             });
 
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+                .allow_headers(Any);
+
             let app = Router::new()
                 .route("/api/verify", get(verify_token))
                 .route("/api/health", get(health_check))
                 .route("/api/stats", get(get_stats))
-                .route("/api/lxcs", get(get_lxcs))
-                .route("/api/proxy-rules", get(get_proxy_rules).post(add_proxy_rule))
+                .route("/api/lxcs", get(routes::lxc::get_lxcs))
+                .route("/api/lxc/{vmid}/start", post(routes::lxc::start_lxc_handler))
+                .route("/api/lxc/{vmid}/stop", post(routes::lxc::stop_lxc_handler))
+                .route("/api/lxc/{vmid}/restart", post(routes::lxc::restart_lxc_handler))
+                .route("/api/proxy-rules", get(routes::proxy::get_proxy_rules).post(routes::proxy::add_proxy_rule))
+                .route("/api/proxy-rules/{id}", delete(routes::proxy::delete_proxy_rule))
                 .route("/api/convert", post(converter::convert_dockerfile_endpoint))
                 .route("/api/deploy", post(converter::deploy_lxc_endpoint))
-                .route("/api/db/execute", post(db_execute))
-                .route("/api/db/schema", get(db_schema))
-                .route("/api/ws/logs/{vmid}", get(ws_logs_handler))
-                .route("/api/catalog", get(get_catalog))
+                .route("/api/db/execute", post(routes::db::db_execute))
+                .route("/api/db/schema", get(routes::db::db_schema))
+                .route("/api/ws/logs/{vmid}", get(routes::lxc::ws_logs_handler))
+                .route("/api/catalog", get(routes::catalog::get_catalog))
                 .fallback(any(proxy_handler))
+                .layer(cors)
+                .layer(TraceLayer::new_for_http())
                 .with_state(shared_state);
 
             let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
@@ -233,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::PullDocker { image, out } => {
             println!("Pulling OCI/Docker image '{}'...", image);
             let extractor = oci::OciExtractor::new();
-            match extractor.extract_to_dir(image, out).await {
+            match extractor.extract_to_dir(image, out, None).await {
                 Ok(_) => {
                     println!("------------------------------------------------------------");
                     println!("Successfully pulled and compressed to: {}", out.display());
@@ -249,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::UpdateLxc { image, vmid, out } => {
             println!("Updating Proxmox LXC Container {} using image '{}'...", vmid, image);
             let extractor = oci::OciExtractor::new();
-            match extractor.extract_to_dir(image, out).await {
+            match extractor.extract_to_dir(image, out, None).await {
                 Ok(status) => {
                     let proxmox = proxmox::ProxmoxClient::new();
                     let node = "pve";
@@ -270,14 +256,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = proxmox.delete_lxc(node, *vmid).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             let mut params = std::collections::HashMap::new();
-                            params.insert("vmid", vmid.to_string());
-                            params.insert("ostemplate", format!("local:vztmpl/hostable_vmid_{}.tar.xz", vmid));
-                            params.insert("hostname", format!("hostable-{}", vmid));
-                            params.insert("memory", "512".to_string());
-                            params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
-                            params.insert("storage", "local-lvm".to_string());
-                            params.insert("rootfs", "local-lvm:8".to_string());
-                            params.insert("tags", "hostable".to_string());
+                            params.insert("vmid".to_string(), vmid.to_string());
+                            params.insert("ostemplate".to_string(), format!("local:vztmpl/hostable_vmid_{}.tar.xz", vmid));
+                            params.insert("hostname".to_string(), format!("hostable-{}", vmid));
+                            params.insert("memory".to_string(), "512".to_string());
+                            params.insert("net0".to_string(), "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                            params.insert("storage".to_string(), "local-lvm".to_string());
+                            params.insert("rootfs".to_string(), "local-lvm:8".to_string());
+                            params.insert("tags".to_string(), "hostable".to_string());
                             let _ = proxmox.create_lxc(node, *vmid, params).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             let _ = proxmox.start_lxc(node, *vmid).await;
@@ -310,7 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Checking deployment for VMID {} (Image: {})", dep.vmid, dep.image);
                     let extractor = oci::OciExtractor::new();
                     let out_path = std::path::PathBuf::from(format!("/cache/hostable_vmid_{}.tar.xz", dep.vmid));
-                    match extractor.extract_to_dir(&dep.image, &out_path).await {
+                    match extractor.extract_to_dir(&dep.image, &out_path, None).await {
                         Ok(status) => {
                             match status {
                                 oci::UpdateStatus::Unchanged => {
@@ -329,14 +315,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = proxmox.delete_lxc(node, dep.vmid).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                     let mut params = std::collections::HashMap::new();
-                                    params.insert("vmid", dep.vmid.to_string());
-                                    params.insert("ostemplate", format!("local:vztmpl/hostable_vmid_{}.tar.xz", dep.vmid));
-                                    params.insert("hostname", format!("hostable-{}", dep.vmid));
-                                    params.insert("memory", "512".to_string());
-                                    params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
-                                    params.insert("storage", "local-lvm".to_string());
-                                    params.insert("rootfs", "local-lvm:8".to_string());
-                                    params.insert("tags", "hostable".to_string());
+                                    params.insert("vmid".to_string(), dep.vmid.to_string());
+                                    params.insert("ostemplate".to_string(), format!("local:vztmpl/hostable_vmid_{}.tar.xz", dep.vmid));
+                                    params.insert("hostname".to_string(), format!("hostable-{}", dep.vmid));
+                                    params.insert("memory".to_string(), "512".to_string());
+                                    params.insert("net0".to_string(), "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                                    params.insert("storage".to_string(), "local-lvm".to_string());
+                                    params.insert("rootfs".to_string(), "local-lvm:8".to_string());
+                                    params.insert("tags".to_string(), "hostable".to_string());
                                     let _ = proxmox.create_lxc(node, dep.vmid, params).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                     let _ = proxmox.start_lxc(node, dep.vmid).await;
@@ -377,9 +363,9 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -
             })?;
 
         if let Some(r) = rule {
-            let target_ip: String = r.get("target_ip");
-            let target_port: i32 = r.get("target_port");
-            let auth_enabled: Option<bool> = r.try_get("auth_enabled").unwrap_or(Some(false));
+            let target_ip: String = sqlx::Row::get(&r, "target_ip");
+            let target_port: i32 = sqlx::Row::get(&r, "target_port");
+            let auth_enabled: Option<bool> = sqlx::Row::try_get(&r, "auth_enabled").unwrap_or(Some(false));
             
             if auth_enabled.unwrap_or(false) {
                 let authelia_url = env::var("AUTHELIA_URL").unwrap_or_else(|_| "http://localhost:9091".into());
@@ -413,13 +399,16 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -
             tracing::info!("Proxying request from {} to {}", domain, target_uri);
 
             let method = req.method().clone();
-            let mut request_builder = reqwest::Client::new().request(method, &target_uri);
             
+            let mut request_builder = reqwest::Client::new().request(method, &target_uri);
             for (name, value) in req.headers() {
                 if name != axum::http::header::HOST {
                     request_builder = request_builder.header(name, value);
                 }
             }
+            
+            let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap_or_default();
+            request_builder = request_builder.body(body_bytes);
             
             let resp = request_builder.send().await.map_err(|e| {
                 tracing::error!("Proxy upstream error: {}", e);
@@ -458,7 +447,6 @@ async fn static_handler(uri: axum::http::Uri) -> axum::response::Response {
             if path.starts_with("api/") {
                 return (StatusCode::NOT_FOUND, "API route not found").into_response();
             }
-            // Fallback to index.html for SPA routing
             match Assets::get("index.html") {
                 Some(content) => {
                     let mime = mime_guess::from_path("index.html").first_or_octet_stream();
@@ -466,33 +454,6 @@ async fn static_handler(uri: axum::http::Uri) -> axum::response::Response {
                 }
                 None => (StatusCode::NOT_FOUND, "Hostable UI not bundled").into_response(),
             }
-        }
-    }
-}
-
-async fn get_catalog(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<Value> {
-    {
-        let cache = state.catalog_cache.read().await;
-        if let Some((time, data)) = &*cache {
-            if time.elapsed() < std::time::Duration::from_secs(3600) {
-                return Json(data.clone());
-            }
-        }
-    }
-
-    let url = "https://api.linuxserver.io/api/v1/images?include_config=false&include_deprecated=false";
-    match reqwest::get(url).await {
-        Ok(res) => {
-            if let Ok(json) = res.json::<Value>().await {
-                let mut cache = state.catalog_cache.write().await;
-                *cache = Some((std::time::Instant::now(), json.clone()));
-                Json(json)
-            } else {
-                Json(json!({"status": "error", "error": "Failed to parse catalog JSON"}))
-            }
-        }
-        Err(e) => {
-            Json(json!({"status": "error", "error": e.to_string()}))
         }
     }
 }
@@ -505,7 +466,7 @@ async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok", "message": "Hostable Proxmox Server is running!"}))
 }
 
-async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+pub async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
     let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     
     let mut total_cpu = 0.0;
@@ -543,154 +504,6 @@ async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Re
         "disk": ((total_disk_used / total_disk_max) * 100.0).round() as u64,
         "activeLxcs": active_lxcs
     })))
-}
-
-async fn get_lxcs(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
-    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut mapped = Vec::new();
-    
-    if let Some(data) = resources["data"].as_array() {
-        for item in data {
-            if item["type"] == "lxc" || item["type"] == "qemu" {
-                let id = item["vmid"].as_i64().unwrap_or(0);
-                let name = item["name"].as_str().unwrap_or("unknown");
-                let status = item["status"].as_str().unwrap_or("stopped");
-                let mem = item["maxmem"].as_i64().unwrap_or(0) / 1024 / 1024;
-                let cpu = item["cpu"].as_f64().unwrap_or(0.0) * 100.0;
-                let tags = item["tags"].as_str().unwrap_or("");
-                let vm_type = item["type"].as_str().unwrap_or("unknown");
-                
-                mapped.push(json!({
-                    "id": id,
-                    "name": name,
-                    "status": status,
-                    "mem": format!("{} MB", mem),
-                    "cpu": format!("{:.1}%", cpu),
-                    "tags": tags,
-                    "type": vm_type
-                }));
-            }
-        }
-    }
-    
-    Ok(Json(json!(mapped)))
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProxyRule {
-    id: Option<i32>,
-    domain: String,
-    target_ip: String,
-    target_port: i32,
-    container_id: Option<i32>,
-    auth_enabled: Option<bool>,
-}
-
-async fn get_proxy_rules(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Vec<ProxyRule>>, (StatusCode, String)> {
-    if let Some(pool) = &state.pool {
-        let rules = sqlx::query("SELECT id, domain, target_ip, target_port, container_id, auth_enabled FROM proxy_rules")
-            .fetch_all(pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            
-        let mapped: Vec<ProxyRule> = rules.iter().map(|r| {
-            ProxyRule {
-                id: Some(r.get("id")),
-                domain: r.get("domain"),
-                target_ip: r.get("target_ip"),
-                target_port: r.get("target_port"),
-                container_id: r.get("container_id"),
-                auth_enabled: r.try_get("auth_enabled").ok(),
-            }
-        }).collect();
-        return Ok(Json(mapped));
-    }
-    Err((StatusCode::INTERNAL_SERVER_ERROR, "Database not configured".to_string()))
-}
-
-async fn add_proxy_rule(_auth: RequireAuth, State(state): State<Arc<AppState>>, Json(payload): Json<ProxyRule>) -> Json<Value> {
-    if let Some(pool) = &state.pool {
-        let _ = sqlx::query("INSERT INTO proxy_rules (domain, target_ip, target_port, container_id, auth_enabled) VALUES ($1, $2, $3, $4, $5)")
-            .bind(&payload.domain)
-            .bind(&payload.target_ip)
-            .bind(payload.target_port)
-            .bind(payload.container_id)
-            .bind(payload.auth_enabled.unwrap_or(false))
-            .execute(pool)
-            .await;
-    }
-    Json(json!({"status": "ok"}))
-}
-
-async fn ws_logs_handler(_auth: RequireAuth, AxumPath(vmid): AxumPath<String>, ws: WebSocketUpgrade) -> axum::response::Response {
-    ws.on_upgrade(move |socket| handle_log_socket(socket, vmid))
-}
-
-async fn handle_log_socket(mut socket: WebSocket, vmid: String) {
-    let mut ticker = interval(Duration::from_secs(1));
-    let mut iterations = 0;
-    loop {
-        ticker.tick().await;
-        iterations += 1;
-        if iterations > 300 {
-            let _ = socket.send(Message::Text("[Hostable] Connection auto-closed: Session limit of 5 minutes reached to save server resources.".into())).await;
-            break;
-        }
-        let timestamp = SystemTime::now();
-        let msg = format!("[{}] VM {} log line", timestamp.elapsed().unwrap_or_default().as_secs(), vmid);
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct DbQuery {
-    sql: String,
-}
-
-async fn db_execute(_auth: RequireAuth, State(state): State<Arc<AppState>>, Json(payload): Json<DbQuery>) -> Json<serde_json::Value> {
-    let sql_lower = payload.sql.to_lowercase();
-    let is_modifying = sql_lower.contains("drop") 
-        || sql_lower.contains("truncate") 
-        || sql_lower.contains("delete") 
-        || sql_lower.contains("alter") 
-        || sql_lower.contains("update")
-        || sql_lower.contains("insert");
-    let targets_system = sql_lower.contains("users") || sql_lower.contains("proxy_rules");
-
-    if is_modifying && targets_system {
-        return Json(serde_json::json!({
-            "status": "error",
-            "error": "Security Error: Modifications to core Hostable system tables (users, proxy_rules) are prohibited through the DB Provisioning tool."
-        }));
-    }
-
-    if let Some(pool) = &state.pool {
-        match sqlx::query(&payload.sql).execute(pool).await {
-            Ok(res) => Json(serde_json::json!({"status": "ok", "rows_affected": res.rows_affected()})),
-            Err(e) => Json(serde_json::json!({"status": "error", "error": e.to_string()})),
-        }
-    } else {
-        Json(serde_json::json!({"status": "mock", "message": "No DB connection in mock mode"}))
-    }
-}
-
-async fn db_schema(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    if let Some(pool) = &state.pool {
-        let rows = sqlx::query("SELECT tablename FROM pg_tables WHERE schemaname='public'")
-            .fetch_all(pool)
-            .await;
-        match rows {
-            Ok(r) => {
-                let tables: Vec<String> = r.iter().map(|row| row.get::<String, _>("tablename")).collect();
-                Json(serde_json::json!({"status": "ok", "tables": tables}))
-            }
-            Err(e) => Json(serde_json::json!({"status": "error", "error": e.to_string()})),
-        }
-    } else {
-        Json(serde_json::json!({"status": "mock", "tables": ["users", "proxy_rules", "example"]}))
-    }
 }
 
 pub struct RequireAuth;
@@ -737,58 +550,5 @@ where
         }
 
         Err((StatusCode::UNAUTHORIZED, "Invalid API token"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::Json;
-
-    #[tokio::test]
-    async fn test_db_execute_security_guards() {
-        let state = Arc::new(AppState {
-            proxmox: proxmox::ProxmoxClient::new(),
-            pool: None,
-        });
-
-        let query = DbQuery {
-            sql: "CREATE TABLE selfhost_app (id SERIAL PRIMARY KEY, name VARCHAR(255))".to_string(),
-        };
-        let Json(res) = db_execute(RequireAuth, State(state.clone()), Json(query)).await;
-        assert_eq!(res["status"], "mock");
-
-        let query_danger = DbQuery {
-            sql: "DROP TABLE users".to_string(),
-        };
-        let Json(res_danger) = db_execute(RequireAuth, State(state.clone()), Json(query_danger)).await;
-        assert_eq!(res_danger["status"], "error");
-        assert!(res_danger["error"].as_str().unwrap().contains("prohibited"));
-
-        let query_danger_2 = DbQuery {
-            sql: "ALTER TABLE proxy_rules ADD COLUMN hack VARCHAR(100)".to_string(),
-        };
-        let Json(res_danger_2) = db_execute(RequireAuth, State(state.clone()), Json(query_danger_2)).await;
-        assert_eq!(res_danger_2["status"], "error");
-    }
-
-    #[tokio::test]
-    async fn test_db_schema_mock() {
-        let state = Arc::new(AppState {
-            proxmox: proxmox::ProxmoxClient::new(),
-            pool: None,
-        });
-
-        let Json(res) = db_schema(RequireAuth, State(state)).await;
-        assert_eq!(res["status"], "mock");
-        assert!(res["tables"].as_array().is_some());
-        let tables: Vec<String> = res["tables"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t.as_str().unwrap().to_string())
-            .collect();
-        assert!(tables.contains(&"users".to_string()));
-        assert!(tables.contains(&"proxy_rules".to_string()));
     }
 }

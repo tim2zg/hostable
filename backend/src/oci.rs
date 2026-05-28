@@ -260,7 +260,7 @@ impl OciExtractor {
     }
 
     /// Pulls the manifests and downloads all OCI image layers, extracting them to a target directory.
-    pub async fn extract_to_dir(&self, image_str: &str, target_path: &Path) -> Result<UpdateStatus, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn extract_to_dir(&self, image_str: &str, target_path: &Path, env_vars: Option<&[String]>) -> Result<UpdateStatus, Box<dyn std::error::Error + Send + Sync>> {
         let img = OciImageRef::parse(image_str)?;
         let token = self.fetch_token(&img).await?;
         
@@ -371,6 +371,29 @@ impl OciExtractor {
             tracing::info!("Image hasn't changed. Using existing cache...");
             if !target_path.exists() {
                 tracing::info!("Compressing rootfs to {}...", target_path.display());
+                
+                if let Some(envs) = env_vars {
+                    if !envs.is_empty() {
+                        let profile_dir = cache_dir.join("etc").join("profile.d");
+                        let _ = fs::create_dir_all(&profile_dir);
+                        let mut content = String::from("#!/bin/sh\n");
+                        for e in envs {
+                            content.push_str(&format!("export {}\n", e));
+                        }
+                        let _ = fs::write(profile_dir.join("hostable-env.sh"), &content);
+                        let meta = PosixMetadata {
+                            entry_type: b'0',
+                            mode: 0o755,
+                            uid: 0,
+                            gid: 0,
+                            size: content.len() as u64,
+                            mtime: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                            link_name: None,
+                        };
+                        file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
+                    }
+                }
+                
                 compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
             }
             return Ok(UpdateStatus::Unchanged);
@@ -429,6 +452,29 @@ impl OciExtractor {
         fs::write(&meta_file, serde_json::to_string(&state)?)?;
 
         tracing::info!("Extract completed successfully. Compressing rootfs to {}...", target_path.display());
+        
+        if let Some(envs) = env_vars {
+            if !envs.is_empty() {
+                let profile_dir = cache_dir.join("etc").join("profile.d");
+                let _ = fs::create_dir_all(&profile_dir);
+                let mut content = String::from("#!/bin/sh\n");
+                for e in envs {
+                    content.push_str(&format!("export {}\n", e));
+                }
+                let _ = fs::write(profile_dir.join("hostable-env.sh"), &content);
+                let meta = PosixMetadata {
+                    entry_type: b'0',
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    size: content.len() as u64,
+                    mtime: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    link_name: None,
+                };
+                file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
+            }
+        }
+        
         compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
 
         Ok(final_status)

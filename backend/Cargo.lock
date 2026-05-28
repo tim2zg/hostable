@@ -187,6 +187,7 @@ dependencies = [
  "sqlx",
  "tar",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "xz2",
@@ -2724,6 +2725,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
