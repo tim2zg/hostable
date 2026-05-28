@@ -33,6 +33,7 @@ struct Assets;
 pub struct AppState {
     pub proxmox: proxmox::ProxmoxClient,
     pub pool: Option<sqlx::PgPool>,
+    pub catalog_cache: tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>,
 }
 
 use sqlx::Row;
@@ -174,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let shared_state = Arc::new(AppState {
                 proxmox: proxmox::ProxmoxClient::new(),
                 pool: _pool,
+                catalog_cache: tokio::sync::RwLock::new(None),
             });
 
             let app = Router::new()
@@ -267,7 +269,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             let _ = proxmox.delete_lxc(node, *vmid).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            let _ = proxmox.create_lxc(*vmid, &format!("hostable-{}", vmid)).await;
+                            let mut params = std::collections::HashMap::new();
+                            params.insert("vmid", vmid.to_string());
+                            params.insert("ostemplate", format!("local:vztmpl/hostable_vmid_{}.tar.xz", vmid));
+                            params.insert("hostname", format!("hostable-{}", vmid));
+                            params.insert("memory", "512".to_string());
+                            params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                            params.insert("storage", "local-lvm".to_string());
+                            params.insert("rootfs", "local-lvm:8".to_string());
+                            params.insert("tags", "hostable".to_string());
+                            let _ = proxmox.create_lxc(node, *vmid, params).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             let _ = proxmox.start_lxc(node, *vmid).await;
                         }
@@ -317,7 +328,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                     let _ = proxmox.delete_lxc(node, dep.vmid).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                    let _ = proxmox.create_lxc(dep.vmid, &format!("hostable-{}", dep.vmid)).await;
+                                    let mut params = std::collections::HashMap::new();
+                                    params.insert("vmid", dep.vmid.to_string());
+                                    params.insert("ostemplate", format!("local:vztmpl/hostable_vmid_{}.tar.xz", dep.vmid));
+                                    params.insert("hostname", format!("hostable-{}", dep.vmid));
+                                    params.insert("memory", "512".to_string());
+                                    params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                                    params.insert("storage", "local-lvm".to_string());
+                                    params.insert("rootfs", "local-lvm:8".to_string());
+                                    params.insert("tags", "hostable".to_string());
+                                    let _ = proxmox.create_lxc(node, dep.vmid, params).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                     let _ = proxmox.start_lxc(node, dep.vmid).await;
                                 }
@@ -450,11 +470,22 @@ async fn static_handler(uri: axum::http::Uri) -> axum::response::Response {
     }
 }
 
-async fn get_catalog(_auth: RequireAuth) -> Json<Value> {
+async fn get_catalog(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<Value> {
+    {
+        let cache = state.catalog_cache.read().await;
+        if let Some((time, data)) = &*cache {
+            if time.elapsed() < std::time::Duration::from_secs(3600) {
+                return Json(data.clone());
+            }
+        }
+    }
+
     let url = "https://api.linuxserver.io/api/v1/images?include_config=false&include_deprecated=false";
     match reqwest::get(url).await {
         Ok(res) => {
             if let Ok(json) = res.json::<Value>().await {
+                let mut cache = state.catalog_cache.write().await;
+                *cache = Some((std::time::Instant::now(), json.clone()));
                 Json(json)
             } else {
                 Json(json!({"status": "error", "error": "Failed to parse catalog JSON"}))
@@ -474,74 +505,75 @@ async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok", "message": "Hostable Proxmox Server is running!"}))
 }
 
-async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<Value> {
-    if let Ok(nodes_data) = state.proxmox.get_nodes().await {
-        if let Some(nodes) = nodes_data["data"].as_array() {
-            if let Some(first_node) = nodes.first() {
-                if let Some(node_name) = first_node["node"].as_str() {
-                    if let Ok(status) = state.proxmox.get_node_status(node_name).await {
-                        let data = &status["data"];
-                        let cpu = data["cpu"].as_f64().unwrap_or(0.0) * 100.0;
-                        let mem_used = data["memory"]["used"].as_f64().unwrap_or(0.0);
-                        let mem_total = data["memory"]["total"].as_f64().unwrap_or(1.0);
-                        let disk_used = data["rootfs"]["used"].as_f64().unwrap_or(0.0);
-                        let disk_total = data["rootfs"]["total"].as_f64().unwrap_or(1.0);
-
-                        return Json(json!({
-                            "cpu": cpu.round() as u64,
-                            "ram": ((mem_used / mem_total) * 100.0).round() as u64,
-                            "disk": ((disk_used / disk_total) * 100.0).round() as u64,
-                            "activeLxcs": 3
-                        }));
-                    }
+async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    let mut total_cpu = 0.0;
+    let mut total_mem_used = 0.0;
+    let mut total_mem_max = 0.0;
+    let mut total_disk_used = 0.0;
+    let mut total_disk_max = 0.0;
+    let mut active_lxcs = 0;
+    let mut node_count = 0.0;
+    
+    if let Some(data) = resources["data"].as_array() {
+        for item in data {
+            if item["type"] == "node" {
+                total_cpu += item["cpu"].as_f64().unwrap_or(0.0);
+                total_mem_used += item["mem"].as_f64().unwrap_or(0.0);
+                total_mem_max += item["maxmem"].as_f64().unwrap_or(1.0);
+                total_disk_used += item["disk"].as_f64().unwrap_or(0.0);
+                total_disk_max += item["maxdisk"].as_f64().unwrap_or(1.0);
+                node_count += 1.0;
+            } else if item["type"] == "lxc" || item["type"] == "qemu" {
+                if item["status"] == "running" {
+                    active_lxcs += 1;
                 }
             }
         }
     }
-
-    Json(json!({
-        "cpu": 18,
-        "ram": 55,
-        "disk": 42,
-        "activeLxcs": 3
-    }))
+    
+    if node_count == 0.0 {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "No nodes found in cluster".to_string()));
+    }
+    
+    Ok(Json(json!({
+        "cpu": ((total_cpu / node_count) * 100.0).round() as u64,
+        "ram": ((total_mem_used / total_mem_max) * 100.0).round() as u64,
+        "disk": ((total_disk_used / total_disk_max) * 100.0).round() as u64,
+        "activeLxcs": active_lxcs
+    })))
 }
 
-async fn get_lxcs(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<Value> {
-    if let Ok(nodes_data) = state.proxmox.get_nodes().await {
-        if let Some(nodes) = nodes_data["data"].as_array() {
-            if let Some(first_node) = nodes.first() {
-                if let Some(node_name) = first_node["node"].as_str() {
-                    if let Ok(lxcs) = state.proxmox.get_lxcs(node_name).await {
-                        if let Some(lxc_array) = lxcs["data"].as_array() {
-                            let mapped: Vec<Value> = lxc_array.iter().map(|lxc| {
-                                let id = lxc["vmid"].as_i64().unwrap_or(0);
-                                let name = lxc["name"].as_str().unwrap_or("unknown");
-                                let status = lxc["status"].as_str().unwrap_or("stopped");
-                                let mem = lxc["maxmem"].as_i64().unwrap_or(0) / 1024 / 1024;
-                                let cpu = lxc["cpu"].as_f64().unwrap_or(0.0) * 100.0;
-
-                                json!({
-                                    "id": id,
-                                    "name": name,
-                                    "status": status,
-                                    "mem": format!("{} MB", mem),
-                                    "cpu": format!("{:.1}%", cpu)
-                                })
-                            }).collect();
-                            return Json(json!(mapped));
-                        }
-                    }
-                }
+async fn get_lxcs(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut mapped = Vec::new();
+    
+    if let Some(data) = resources["data"].as_array() {
+        for item in data {
+            if item["type"] == "lxc" || item["type"] == "qemu" {
+                let id = item["vmid"].as_i64().unwrap_or(0);
+                let name = item["name"].as_str().unwrap_or("unknown");
+                let status = item["status"].as_str().unwrap_or("stopped");
+                let mem = item["maxmem"].as_i64().unwrap_or(0) / 1024 / 1024;
+                let cpu = item["cpu"].as_f64().unwrap_or(0.0) * 100.0;
+                let tags = item["tags"].as_str().unwrap_or("");
+                let vm_type = item["type"].as_str().unwrap_or("unknown");
+                
+                mapped.push(json!({
+                    "id": id,
+                    "name": name,
+                    "status": status,
+                    "mem": format!("{} MB", mem),
+                    "cpu": format!("{:.1}%", cpu),
+                    "tags": tags,
+                    "type": vm_type
+                }));
             }
         }
     }
-
-    Json(json!([
-        { "id": 101, "name": "nginx-proxy", "status": "running", "mem": "128 MB", "cpu": "1.0%" },
-        { "id": 102, "name": "postgres-db", "status": "stopped", "mem": "0 MB", "cpu": "0.0%" },
-        { "id": 103, "name": "pihole", "status": "running", "mem": "84 MB", "cpu": "0.5%" }
-    ]))
+    
+    Ok(Json(json!(mapped)))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -554,30 +586,26 @@ struct ProxyRule {
     auth_enabled: Option<bool>,
 }
 
-async fn get_proxy_rules(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Json<Vec<ProxyRule>> {
+async fn get_proxy_rules(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Vec<ProxyRule>>, (StatusCode, String)> {
     if let Some(pool) = &state.pool {
         let rules = sqlx::query("SELECT id, domain, target_ip, target_port, container_id, auth_enabled FROM proxy_rules")
             .fetch_all(pool)
-            .await;
-        if let Ok(r_list) = rules {
-            let mapped: Vec<ProxyRule> = r_list.iter().map(|r| {
-                ProxyRule {
-                    id: Some(r.get("id")),
-                    domain: r.get("domain"),
-                    target_ip: r.get("target_ip"),
-                    target_port: r.get("target_port"),
-                    container_id: r.get("container_id"),
-                    auth_enabled: r.try_get("auth_enabled").ok(),
-                }
-            }).collect();
-            return Json(mapped);
-        }
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            
+        let mapped: Vec<ProxyRule> = rules.iter().map(|r| {
+            ProxyRule {
+                id: Some(r.get("id")),
+                domain: r.get("domain"),
+                target_ip: r.get("target_ip"),
+                target_port: r.get("target_port"),
+                container_id: r.get("container_id"),
+                auth_enabled: r.try_get("auth_enabled").ok(),
+            }
+        }).collect();
+        return Ok(Json(mapped));
     }
-
-    Json(vec![
-        ProxyRule { id: Some(1), domain: "pihole.local".into(), target_ip: "10.0.0.5".into(), target_port: 80, container_id: Some(103), auth_enabled: Some(false) },
-        ProxyRule { id: Some(2), domain: "jellyfin.local".into(), target_ip: "10.0.0.6".into(), target_port: 8096, container_id: Some(104), auth_enabled: Some(true) },
-    ])
+    Err((StatusCode::INTERNAL_SERVER_ERROR, "Database not configured".to_string()))
 }
 
 async fn add_proxy_rule(_auth: RequireAuth, State(state): State<Arc<AppState>>, Json(payload): Json<ProxyRule>) -> Json<Value> {

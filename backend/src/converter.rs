@@ -19,6 +19,20 @@ pub async fn convert_dockerfile_endpoint(
     (StatusCode::OK, Json(ConvertResponse { yaml }))
 }
 
+#[derive(Deserialize)]
+pub struct DeployRequest {
+    pub image: String,
+    pub hostname: String,
+    pub vmid: u32,
+    pub memory: String,
+    pub template_storage: String,
+    pub rootfs_storage: String,
+    pub env_vars: Vec<String>,
+    pub volumes: Vec<String>,
+    pub use_hostable_db: bool,
+    pub db_name: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct DeployResponse {
     pub status: String,
@@ -26,17 +40,81 @@ pub struct DeployResponse {
 }
 
 pub async fn deploy_lxc_endpoint(
-    Json(payload): Json<ConvertRequest>,
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(payload): Json<DeployRequest>,
 ) -> impl IntoResponse {
-    let _yaml = convert_dockerfile_to_distrobuilder(&payload.dockerfile);
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    (
-        StatusCode::OK,
-        Json(DeployResponse {
-            status: "ok".to_string(),
-            message: "Simulated LXC container deployment succeeded!".to_string(),
-        }),
-    )
+    let node = "pve";
+    
+    // 1. Process DB Provisioning
+    let mut final_envs = payload.env_vars.clone();
+    if payload.use_hostable_db {
+        if let Some(db_name) = &payload.db_name {
+            if let Some(pool) = &state.pool {
+                // Warning: In production, sanitize this db_name
+                let safe_db = db_name.replace("\"", "").replace("'", "");
+                let q = format!("CREATE DATABASE \"{}\"", safe_db);
+                if let Err(e) = sqlx::query(&q).execute(pool).await {
+                    println!("Failed to create DB (might exist): {}", e);
+                }
+                
+                if let Ok(ip) = local_ip_address::local_ip() {
+                    // For now, assuming hostable connects as admin user, we will just pass the admin credentials or a dedicated user
+                    let db_url = format!("postgres://postgres:postgres@{}:5432/{}", ip.to_string(), safe_db);
+                    final_envs.push(format!("DATABASE_URL={}", db_url));
+                }
+            }
+        }
+    }
+
+    // 2. Extract Docker Image to Proxmox Rootfs
+    let extractor = crate::oci::OciExtractor::new();
+    let cache_dir = std::path::PathBuf::from("/cache");
+    if !cache_dir.exists() {
+        let _ = std::fs::create_dir_all(&cache_dir);
+    }
+    let out_path = cache_dir.join(format!("hostable_vmid_{}.tar.xz", payload.vmid));
+    let filename = format!("hostable_vmid_{}.tar.xz", payload.vmid);
+    
+    match extractor.extract_to_dir(&payload.image, &out_path).await {
+        Ok(_) => {
+            // 3. Upload to Proxmox
+            match state.proxmox.upload_template(node, &payload.template_storage, &out_path, &filename).await {
+                Ok(_) => {
+                    // 4. Create LXC
+                    let mut params = std::collections::HashMap::new();
+                    params.insert("vmid", payload.vmid.to_string());
+                    params.insert("ostemplate", format!("{}:vztmpl/{}", payload.template_storage, filename));
+                    params.insert("hostname", payload.hostname.clone());
+                    params.insert("memory", payload.memory.clone());
+                    params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                    params.insert("storage", payload.rootfs_storage.clone());
+                    params.insert("rootfs", format!("{}:8", payload.rootfs_storage));
+                    params.insert("tags", "hostable".to_string());
+                    params.insert("unprivileged", "1".to_string());
+                    params.insert("features", "nesting=1".to_string());
+
+                    // Env formatting (LXC hook) - temporary hack, setting it via Proxmox doesn't perfectly map to OCI ENV easily without modifying the rootfs.
+                    // But we can add them to a file in the rootfs before compression in the future.
+                    // For now, we will just proceed with creating.
+
+                    match state.proxmox.create_lxc(node, payload.vmid, params).await {
+                        Ok(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                            let _ = state.proxmox.start_lxc(node, payload.vmid).await;
+                            
+                            (StatusCode::OK, Json(DeployResponse {
+                                status: "ok".to_string(),
+                                message: format!("Successfully deployed {} as LXC {}", payload.hostname, payload.vmid),
+                            }))
+                        },
+                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Create failed: {}", e) }))
+                    }
+                },
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Upload failed: {}", e) }))
+            }
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Extraction failed: {}", e) }))
+    }
 }
 
 pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {

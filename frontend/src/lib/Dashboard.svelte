@@ -19,8 +19,7 @@
       }
     } catch (err) {
       console.error(err);
-      // Fallback for offline/mock development
-      stats = { cpu: 18, ram: 55, disk: 42, activeLxcs: 3 };
+      errorMsg = "Unable to connect to Proxmox API.";
     }
   }
 
@@ -100,8 +99,8 @@
 
 <div class="dashboard-container animate-fade-in">
   <div>
-    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Proxmox Node Status</h1>
-    <p style="color: #94a3b8; font-size: 1rem;">Real-time hardware resource allocation and LXC instances.</p>
+    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Proxmox Cluster Status</h1>
+    <p style="color: #94a3b8; font-size: 1rem;">Real-time cluster resources and active instances.</p>
   </div>
 
   {#if errorMsg}

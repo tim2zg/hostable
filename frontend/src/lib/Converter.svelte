@@ -1,177 +1,239 @@
 <script lang="ts">
-  let dockerfile = `FROM alpine:3.19\nRUN apk add --no-cache nginx\nENV PORT=80\nCMD ["nginx", "-g", "daemon off;"]`;
-  let distrobuilderYaml = "";
-  let isConverting = false;
-  let errorMsg = "";
+  import { onMount } from 'svelte';
 
-  async function convert() {
-    if (!dockerfile.trim()) return;
-    isConverting = true;
-    errorMsg = "";
-    distrobuilderYaml = "";
+  let image = '';
+  let hostname = '';
+  let targetVmid = '';
+  let memory = '512';
+  let envVars: {key: string, value: string}[] = [];
+  let volumes: {host: string, container: string}[] = [];
+  let useHostableDb = false;
+  let dbName = '';
+  let templateStorage = 'local';
+  let rootfsStorage = 'local-lvm';
+  
+  let isDeploying = false;
+  let deployStatus = '';
+  let deployProgress = 0;
+
+  onMount(() => {
+    targetVmid = Math.floor(Math.random() * (900 - 200 + 1) + 200).toString();
+    templateStorage = localStorage.getItem('hostable_tpl_storage') || 'local';
+    rootfsStorage = localStorage.getItem('hostable_rootfs_storage') || 'local-lvm';
+  });
+
+  async function deployApp() {
+    if (!targetVmid || !image || !hostname) return;
+    
+    isDeploying = true;
+    deployStatus = 'Preparing Deployment...';
+    deployProgress = 20;
 
     try {
-      const res = await fetch('/api/convert', {
+      const payload = {
+        image,
+        hostname,
+        vmid: parseInt(targetVmid),
+        memory,
+        template_storage: templateStorage,
+        rootfs_storage: rootfsStorage,
+        env_vars: envVars.filter(e => e.key).map(e => `${e.key}=${e.value}`),
+        volumes: volumes.filter(v => v.host).map(v => `${v.host}:${v.container}`),
+        use_hostable_db: useHostableDb,
+        db_name: useHostableDb ? dbName : null,
+      };
+
+      deployStatus = 'Deploying LXC Container (this may take a minute)...';
+      deployProgress = 60;
+
+      const deployRes = await fetch('/api/deploy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dockerfile })
+        body: JSON.stringify(payload)
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        distrobuilderYaml = data.yaml;
-      } else {
-        errorMsg = "Conversion failed on the server. Please check Dockerfile syntax.";
-      }
-    } catch (err) {
-      console.error(err);
-      // Local demo fallback
-      distrobuilderYaml = `image:\n  distribution: alpinelinux\n  release: 3.19\n  architecture: x86_64\n\nsource:\n  downloader: alpinelinux-http\n  url: http://dl-cdn.alpinelinux.org/alpine\n\nactions:\n  - trigger: post-packages\n    action: |-\n      #!/bin/sh\n      set -e\n      export PORT=80\n      apk add --no-cache nginx\n      echo '#!/bin/sh' > /etc/local.d/hostable.start\n      echo 'nginx -g "daemon off;"' >> /etc/local.d/hostable.start\n      chmod +x /etc/local.d/hostable.start\n      rc-update add local default`;
-    } finally {
-      isConverting = false;
+      
+      const responseData = await deployRes.json();
+      if (!deployRes.ok) throw new Error(responseData.message || 'Deployment failed');
+      
+      deployStatus = 'Success! Container deployed and starting.';
+      deployProgress = 100;
+      
+    } catch (err: any) {
+      deployStatus = `Error: ${err.message}`;
+      isDeploying = false;
     }
   }
+
+  function addEnv() { envVars = [...envVars, {key: '', value: ''}]; }
+  function removeEnv(idx: number) { envVars = envVars.filter((_, i) => i !== idx); }
+  function addVol() { volumes = [...volumes, {host: '', container: ''}]; }
+  function removeVol(idx: number) { volumes = volumes.filter((_, i) => i !== idx); }
 </script>
 
 <style>
-  .converter-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1.5rem;
-    height: calc(100vh - 12rem);
+  .custom-deploy-container {
+    max-width: 800px;
   }
 
-  @media (max-width: 900px) {
-    .converter-grid {
-      grid-template-columns: 1fr;
-      height: auto;
-    }
-  }
-
-  .flat-panel {
+  .flat-card {
     background: #1e293b;
     border: 1px solid #334155;
     border-radius: 8px;
-    padding: 1.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
+    padding: 2rem;
     box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
   }
 
-  .panel-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 0.75rem;
+  .form-group {
+    margin-bottom: 1.5rem;
   }
 
-  .panel-header h3 {
-    font-size: 1.1rem;
+  .form-group label {
+    display: block;
     color: #cbd5e1;
+    font-size: 0.95rem;
+    margin-bottom: 0.5rem;
     font-weight: 500;
   }
 
-  .editor-area {
-    flex-grow: 1;
+  .form-group input {
     width: 100%;
-    min-height: 250px;
     background: #0f172a;
     border: 1px solid #334155;
+    color: #f8fafc;
     border-radius: 6px;
-    color: #e2e8f0;
-    font-family: monospace;
-    font-size: 0.95rem;
-    padding: 1rem;
-    resize: none;
-    outline: none;
+    padding: 0.8rem;
+    font-size: 1rem;
+    box-sizing: border-box;
   }
 
-  .editor-area:focus {
+  .form-group input:focus {
+    outline: none;
     border-color: #38bdf8;
   }
 
-  .flat-btn-primary {
+  .btn-primary {
+    width: 100%;
     background: #38bdf8;
-    border: none;
     color: #0f172a;
+    border: none;
     border-radius: 6px;
-    padding: 0.5rem 1.2rem;
-    font-size: 0.95rem;
+    padding: 1rem;
     font-weight: 600;
     cursor: pointer;
+    font-size: 1.1rem;
     transition: background 0.2s;
   }
 
-  .flat-btn-primary:hover:not(:disabled) {
+  .btn-primary:hover:not(:disabled) {
     background: #0ea5e9;
   }
 
-  .flat-btn-primary:disabled {
+  .btn-primary:disabled {
     background: #475569;
     color: #94a3b8;
     cursor: not-allowed;
   }
 
-  .pre-yaml {
-    flex-grow: 1;
-    background: #020617;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 1rem;
-    color: #4ade80;
-    font-family: monospace;
-    font-size: 0.9rem;
-    overflow: auto;
-    white-space: pre-wrap;
-    text-align: left;
+  .progress-bar {
+    width: 100%;
+    height: 8px;
+    background: #0f172a;
+    border-radius: 4px;
+    margin-top: 1rem;
+    overflow: hidden;
   }
-
-  .error-banner {
-    padding: 0.8rem;
-    background: rgba(239, 68, 68, 0.15);
-    border: 1px solid #ef4444;
-    color: #f87171;
-    border-radius: 6px;
-    font-size: 0.9rem;
+  
+  .progress-fill {
+    height: 100%;
+    background: #38bdf8;
+    transition: width 0.3s ease;
   }
 </style>
 
-<div class="animate-fade-in" style="height: 100%;">
+<div class="custom-deploy-container animate-fade-in">
   <div style="margin-bottom: 2rem;">
-    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">LXC Template Converter</h1>
-    <p style="color: #94a3b8; font-size: 1rem;">Translate standard image Dockerfiles directly into native Proxmox Distrobuilder configurations.</p>
+    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Custom Deploy</h1>
+    <p style="color: #94a3b8; font-size: 1rem;">Deploy any Docker image directly to a Proxmox LXC container.</p>
   </div>
 
-  {#if errorMsg}
-    <div class="error-banner" style="margin-bottom: 1rem;">{errorMsg}</div>
-  {/if}
-
-  <div class="converter-grid">
-    <!-- Dockerfile Input Panel -->
-    <div class="flat-panel">
-      <div class="panel-header">
-        <h3>Input Dockerfile</h3>
-        <button class="flat-btn-primary" on:click={convert} disabled={isConverting || !dockerfile.trim()}>
-          {isConverting ? 'Converting...' : '⚡ Convert to YAML'}
-        </button>
+  <div class="flat-card">
+    <div style="display: flex; gap: 1rem;">
+      <div class="form-group" style="flex: 2;">
+        <label for="image">Docker Image</label>
+        <input id="image" type="text" bind:value={image} placeholder="e.g. redis:latest" disabled={isDeploying} />
       </div>
-      <textarea class="editor-area" bind:value={dockerfile} placeholder="Paste Dockerfile lines here..."></textarea>
+      <div class="form-group" style="flex: 1;">
+        <label for="hostname">Hostname</label>
+        <input id="hostname" type="text" bind:value={hostname} placeholder="e.g. redis-db" disabled={isDeploying} />
+      </div>
     </div>
 
-    <!-- Distrobuilder YAML Output Panel -->
-    <div class="flat-panel">
-      <div class="panel-header">
-        <h3>Distrobuilder YAML Output</h3>
+    <div style="display: flex; gap: 1rem;">
+      <div class="form-group" style="flex: 1;">
+        <label for="vmid">Target VMID</label>
+        <input id="vmid" type="number" bind:value={targetVmid} disabled={isDeploying} />
       </div>
-      {#if distrobuilderYaml}
-        <pre class="pre-yaml">{distrobuilderYaml}</pre>
-      {:else}
-        <div style="flex-grow: 1; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 0.95rem; border: 1px dashed #334155; border-radius: 6px;">
-          YAML output will appear here after conversion.
+      <div class="form-group" style="flex: 1;">
+        <label for="memory">Memory (MB)</label>
+        <input id="memory" type="number" bind:value={memory} disabled={isDeploying} />
+      </div>
+    </div>
+
+    <!-- Env Vars -->
+    <div style="margin-bottom: 1.5rem;">
+      <label style="display: flex; justify-content: space-between; color: #cbd5e1; font-size: 0.95rem; margin-bottom: 0.5rem; font-weight: 500;">
+        Environment Variables
+        <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.9rem;" on:click={addEnv} disabled={isDeploying}>+ Add</button>
+      </label>
+      {#each envVars as env, i}
+        <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+          <input type="text" placeholder="KEY" style="flex: 1; padding: 0.6rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={env.key} disabled={isDeploying} />
+          <input type="text" placeholder="VALUE" style="flex: 1; padding: 0.6rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={env.value} disabled={isDeploying} />
+          <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeEnv(i)} disabled={isDeploying}>✖</button>
+        </div>
+      {/each}
+    </div>
+
+    <!-- Volumes -->
+    <div style="margin-bottom: 1.5rem;">
+      <label style="display: flex; justify-content: space-between; color: #cbd5e1; font-size: 0.95rem; margin-bottom: 0.5rem; font-weight: 500;">
+        Volume Mappings
+        <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.9rem;" on:click={addVol} disabled={isDeploying}>+ Add</button>
+      </label>
+      {#each volumes as vol, i}
+        <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+          <input type="text" placeholder="/host/path" style="flex: 1; padding: 0.6rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={vol.host} disabled={isDeploying} />
+          <input type="text" placeholder="/container/path" style="flex: 1; padding: 0.6rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={vol.container} disabled={isDeploying} />
+          <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeVol(i)} disabled={isDeploying}>✖</button>
+        </div>
+      {/each}
+    </div>
+
+    <div style="margin-bottom: 2rem;">
+      <label style="display: flex; align-items: center; gap: 0.5rem; color: #cbd5e1; font-size: 0.95rem; cursor: pointer; font-weight: 500;">
+        <input type="checkbox" bind:checked={useHostableDb} disabled={isDeploying} />
+        Provision Hostable PostgreSQL Database
+      </label>
+      {#if useHostableDb}
+        <div style="margin-top: 0.5rem;">
+          <input type="text" placeholder="Database Name" style="width: 100%; padding: 0.8rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 6px; box-sizing: border-box;" bind:value={dbName} disabled={isDeploying} />
         </div>
       {/if}
     </div>
+
+    {#if deployStatus}
+      <div style="margin-bottom: 1.5rem; color: #cbd5e1; font-size: 1rem; text-align: center;">
+        {deployStatus}
+        {#if isDeploying || deployProgress === 100}
+          <div class="progress-bar">
+            <div class="progress-fill" style="width: {deployProgress}%"></div>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    <button class="btn-primary" on:click={deployApp} disabled={isDeploying || !image || !hostname || !targetVmid}>
+      {isDeploying ? 'Deploying...' : 'Deploy Image'}
+    </button>
   </div>
 </div>

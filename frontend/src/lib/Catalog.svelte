@@ -14,6 +14,14 @@
   let deployStatus = '';
   let deployProgress = 0;
 
+  let memory = '512';
+  let envVars: {key: string, value: string}[] = [];
+  let volumes: {host: string, container: string}[] = [];
+  let useHostableDb = false;
+  let dbName = '';
+  let templateStorage = 'local';
+  let rootfsStorage = 'local-lvm';
+
   onMount(async () => {
     try {
       const res = await fetch('/api/catalog');
@@ -39,6 +47,12 @@
     deployStatus = '';
     isDeploying = false;
     deployProgress = 0;
+    envVars = [];
+    volumes = [];
+    useHostableDb = false;
+    dbName = app.name.replace(/[^a-zA-Z0-9]/g, '');
+    templateStorage = localStorage.getItem('hostable_tpl_storage') || 'local';
+    rootfsStorage = localStorage.getItem('hostable_rootfs_storage') || 'local-lvm';
   }
 
   function closeDeployModal() {
@@ -52,47 +66,52 @@
     if (!targetVmid) return;
     
     isDeploying = true;
-    deployStatus = 'Generating Template...';
+    deployStatus = 'Preparing Deployment...';
     deployProgress = 20;
 
     try {
-      // 1. Convert Dockerfile to Distrobuilder YAML
-      const dockerfile = `FROM lscr.io/linuxserver/${selectedApp.name}:latest`;
-      const convertRes = await fetch('/api/convert', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dockerfile })
-      });
-      
-      if (!convertRes.ok) throw new Error('Conversion failed');
-      const convertData = await convertRes.json();
-      const yaml = convertData.yaml;
-      
-      deployStatus = 'Deploying LXC Container...';
+      const payload = {
+        image: `lscr.io/linuxserver/${selectedApp.name}:latest`,
+        hostname: selectedApp.name,
+        vmid: parseInt(targetVmid),
+        memory,
+        template_storage: templateStorage,
+        rootfs_storage: rootfsStorage,
+        env_vars: envVars.filter(e => e.key).map(e => `${e.key}=${e.value}`),
+        volumes: volumes.filter(v => v.host).map(v => `${v.host}:${v.container}`),
+        use_hostable_db: useHostableDb,
+        db_name: useHostableDb ? dbName : null,
+      };
+
+      deployStatus = 'Deploying LXC Container (this may take a minute)...';
       deployProgress = 60;
 
-      // 2. Deploy LXC Container
-      // Use the same endpoint (in simulation it takes dockerfile payload, but we'll send it)
       const deployRes = await fetch('/api/deploy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dockerfile })
+        body: JSON.stringify(payload)
       });
       
-      if (!deployRes.ok) throw new Error('Deployment failed');
+      const responseData = await deployRes.json();
+      if (!deployRes.ok) throw new Error(responseData.message || 'Deployment failed');
       
-      deployStatus = 'Success! Container deployed.';
+      deployStatus = 'Success! Container deployed and starting.';
       deployProgress = 100;
       
       setTimeout(() => {
         closeDeployModal();
-      }, 2000);
+      }, 3000);
       
     } catch (err: any) {
       deployStatus = `Error: ${err.message}`;
       isDeploying = false;
     }
   }
+
+  function addEnv() { envVars = [...envVars, {key: '', value: ''}]; }
+  function removeEnv(idx: number) { envVars = envVars.filter((_, i) => i !== idx); }
+  function addVol() { volumes = [...volumes, {host: '', container: ''}]; }
+  function removeVol(idx: number) { volumes = volumes.filter((_, i) => i !== idx); }
 </script>
 
 <style>
@@ -352,9 +371,57 @@
         <input id="node" type="text" bind:value={targetNode} disabled={isDeploying} />
       </div>
       
-      <div class="form-group">
-        <label for="vmid">LXC Container ID</label>
-        <input id="vmid" type="number" bind:value={targetVmid} disabled={isDeploying} />
+      <div style="display: flex; gap: 1rem;">
+        <div class="form-group" style="flex: 1;">
+          <label for="vmid">LXC Container ID</label>
+          <input id="vmid" type="number" bind:value={targetVmid} disabled={isDeploying} />
+        </div>
+        <div class="form-group" style="flex: 1;">
+          <label for="memory">Memory (MB)</label>
+          <input id="memory" type="number" bind:value={memory} disabled={isDeploying} />
+        </div>
+      </div>
+
+      <!-- Env Vars -->
+      <div style="margin-bottom: 1rem;">
+        <label style="display: flex; justify-content: space-between; color: #cbd5e1; font-size: 0.9rem; margin-bottom: 0.4rem;">
+          Environment Variables
+          <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.8rem;" on:click={addEnv} disabled={isDeploying}>+ Add</button>
+        </label>
+        {#each envVars as env, i}
+          <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+            <input type="text" placeholder="KEY" style="flex: 1; padding: 0.4rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={env.key} disabled={isDeploying} />
+            <input type="text" placeholder="VALUE" style="flex: 1; padding: 0.4rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={env.value} disabled={isDeploying} />
+            <button style="background: transparent; color: #ef4444; border: none; cursor: pointer;" on:click={() => removeEnv(i)} disabled={isDeploying}>✖</button>
+          </div>
+        {/each}
+      </div>
+
+      <!-- Volumes -->
+      <div style="margin-bottom: 1rem;">
+        <label style="display: flex; justify-content: space-between; color: #cbd5e1; font-size: 0.9rem; margin-bottom: 0.4rem;">
+          Volume Mappings
+          <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.8rem;" on:click={addVol} disabled={isDeploying}>+ Add</button>
+        </label>
+        {#each volumes as vol, i}
+          <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+            <input type="text" placeholder="/host/path" style="flex: 1; padding: 0.4rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={vol.host} disabled={isDeploying} />
+            <input type="text" placeholder="/container/path" style="flex: 1; padding: 0.4rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={vol.container} disabled={isDeploying} />
+            <button style="background: transparent; color: #ef4444; border: none; cursor: pointer;" on:click={() => removeVol(i)} disabled={isDeploying}>✖</button>
+          </div>
+        {/each}
+      </div>
+
+      <div style="margin-bottom: 1rem;">
+        <label style="display: flex; align-items: center; gap: 0.5rem; color: #cbd5e1; font-size: 0.9rem; cursor: pointer;">
+          <input type="checkbox" bind:checked={useHostableDb} disabled={isDeploying} />
+          Provision Hostable PostgreSQL Database
+        </label>
+        {#if useHostableDb}
+          <div style="margin-top: 0.5rem;">
+            <input type="text" placeholder="Database Name" style="width: 100%; padding: 0.4rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px;" bind:value={dbName} disabled={isDeploying} />
+          </div>
+        {/if}
       </div>
       
       {#if deployStatus}

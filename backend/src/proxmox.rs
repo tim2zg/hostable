@@ -34,6 +34,17 @@ impl ProxmoxClient {
         format!("PVEAPIToken={}={}", self.token_id, self.token_secret)
     }
 
+    pub async fn get_cluster_resources(&self) -> Result<serde_json::Value, reqwest::Error> {
+        let url = format!("{}/cluster/resources", self.base_url);
+        
+        let res = self.client.get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+            
+        res.json().await
+    }
+
     pub async fn get_nodes(&self) -> Result<serde_json::Value, reqwest::Error> {
         let url = format!("{}/nodes", self.base_url);
         
@@ -67,20 +78,33 @@ impl ProxmoxClient {
         res.json().await
     }
 
-    pub async fn create_lxc(&self, vmid: u32, hostname: &str) -> Result<serde_json::Value, reqwest::Error> {
-        // Assume default node 'pve' and a generic rootfs for scaffolding purposes.
-        let node = "pve"; 
+    pub async fn upload_template(&self, node: &str, storage: &str, file_path: &std::path::Path, filename: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}/nodes/{}/storage/{}/upload", self.base_url, node, storage);
+        
+        let file_bytes = tokio::fs::read(file_path).await.map_err(|e| e.to_string())?;
+        
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename.to_string())
+            .mime_str("application/x-xz").unwrap();
+            
+        let form = reqwest::multipart::Form::new()
+            .text("content", "vztmpl")
+            .text("filename", filename.to_string())
+            .part("filename", part);
+            
+        let res = self.client.post(&url)
+            .header("Authorization", self.auth_header())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        res.json().await.map_err(|e| e.to_string())
+    }
+
+    pub async fn create_lxc(&self, node: &str, vmid: u32, params: std::collections::HashMap<&str, String>) -> Result<serde_json::Value, reqwest::Error> {
         let url = format!("{}/nodes/{}/lxc", self.base_url, node);
         
-        let mut params = std::collections::HashMap::new();
-        params.insert("vmid", vmid.to_string());
-        params.insert("ostemplate", "local:vztmpl/custom-rootfs.tar.gz".to_string());
-        params.insert("hostname", hostname.to_string());
-        params.insert("memory", "512".to_string());
-        params.insert("net0", "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
-        params.insert("storage", "local-lvm".to_string());
-        params.insert("rootfs", "local-lvm:8".to_string());
-
         let res = self.client.post(&url)
             .header("Authorization", self.auth_header())
             .json(&params)

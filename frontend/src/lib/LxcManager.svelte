@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  type Lxc = { id: number, name: string, status: string, mem: string, cpu: string };
+  type Lxc = { id: number, name: string, status: string, mem: string, cpu: string, tags: string, type: string };
+  let allContainers: Lxc[] = [];
   let containers: Lxc[] = [];
   let isFetching = false;
+  let showHostableOnly = true;
 
   // Terminal Console State
   let activeConsoleId: number | null = null;
@@ -17,19 +19,29 @@
     try {
       const res = await fetch('/api/lxcs');
       if (res.ok) {
-        containers = await res.json();
+        allContainers = await res.json();
+        applyFilter();
       }
     } catch (err) {
       console.error("Failed to fetch LXCs", err);
-      // Mock fallback
-      containers = [
-        { id: 101, name: "nginx-proxy", status: "running", mem: "128MB / 1GB", cpu: "1%" },
-        { id: 102, name: "postgres-db", status: "stopped", mem: "0MB / 2GB", cpu: "0%" },
-        { id: 103, name: "pihole", status: "running", mem: "84MB / 512MB", cpu: "0.5%" },
-      ];
+      allContainers = [];
+      containers = [];
     } finally {
       isFetching = false;
     }
+  }
+
+  function applyFilter() {
+    if (showHostableOnly) {
+      containers = allContainers.filter(ct => ct.tags && ct.tags.includes('hostable'));
+    } else {
+      containers = [...allContainers];
+    }
+  }
+
+  function toggleFilter() {
+    showHostableOnly = !showHostableOnly;
+    applyFilter();
   }
 
   function openConsole(id: number) {
@@ -244,15 +256,26 @@
 </style>
 
 <div class="animate-fade-in">
-  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+  <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2rem;">
     <div>
-      <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">LXC Containers</h1>
+      <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">Cluster Instances</h1>
       <p style="color: #94a3b8; font-size: 1rem;">One-click lifecycle management and remote terminal diagnostics.</p>
     </div>
-    <button class="flat-btn-primary" on:click={fetchContainers} disabled={isFetching}>
-      {isFetching ? 'Refreshing...' : '🔄 Refresh'}
-    </button>
+    <div style="display: flex; gap: 1rem;">
+      <button class="flat-btn-outline" on:click={toggleFilter}>
+        {showHostableOnly ? 'Showing: Hostable Only' : 'Showing: All Instances'}
+      </button>
+      <button class="flat-btn-primary" on:click={fetchContainers} disabled={isFetching}>
+        {isFetching ? 'Refreshing...' : '🔄 Refresh'}
+      </button>
+    </div>
   </div>
+
+  {#if containers.length === 0 && !isFetching}
+    <div class="flat-card" style="text-align: center; color: #94a3b8; padding: 3rem;">
+      No instances found matching the current filter.
+    </div>
+  {/if}
 
   <div class="lxc-list">
     {#each containers as ct}
@@ -260,9 +283,17 @@
         <div class="lxc-header">
           <div style="display: flex; align-items: center; gap: 1rem;">
             <div class="status-dot {ct.status}"></div>
-            <h3 style="font-size: 1.2rem; font-weight: 600; color: #f8fafc;">
+            <h3 style="font-size: 1.2rem; font-weight: 600; color: #f8fafc; display: flex; align-items: center; gap: 0.5rem;">
               {ct.name} 
               <span style="color: #64748b; font-size: 0.9rem; font-weight: normal;">#{ct.id}</span>
+              {#if ct.type === 'qemu'}
+                <span style="background: #334155; color: #cbd5e1; font-size: 0.75rem; padding: 2px 6px; border-radius: 4px;">VM</span>
+              {:else}
+                <span style="background: #0ea5e9; color: #0f172a; font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; font-weight: bold;">LXC</span>
+              {/if}
+              {#if ct.tags && ct.tags.includes('hostable')}
+                <span style="background: rgba(56, 189, 248, 0.1); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.2); font-size: 0.75rem; padding: 1px 6px; border-radius: 4px;">hostable</span>
+              {/if}
             </h3>
           </div>
           

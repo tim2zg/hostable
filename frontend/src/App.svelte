@@ -8,6 +8,7 @@
   import LogViewer from './lib/LogViewer.svelte';
   import DatabaseManager from './lib/DatabaseManager.svelte';
   import Login from './lib/Login.svelte';
+  import Settings from './lib/Settings.svelte';
   import { onMount } from 'svelte';
 
   let currentView = 'dashboard';
@@ -113,6 +114,12 @@
       >
         DB Provision
       </div>
+      <div 
+        class="nav-item {currentView === 'settings' ? 'active' : ''}"
+        on:click={() => setView('settings')}
+      >
+        Settings
+      </div>
     </nav>
   </aside>
 
@@ -132,6 +139,8 @@
       <LogViewer />
     {:else if currentView === 'db'}
       <DatabaseManager />
+    {:else if currentView === 'settings'}
+      <Settings />
     {/if}
   </main>
 </div>
