@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::{self, Cursor, Read};

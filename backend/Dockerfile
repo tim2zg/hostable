@@ -2,7 +2,7 @@ FROM rust:alpine AS builder
 
 WORKDIR /usr/src/app
 # Install dependencies needed for compiling reqwest and xz2
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev xz-dev
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev xz-dev xz-static
 COPY . .
 RUN cargo build --release
 

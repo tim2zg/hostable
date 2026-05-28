@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             println!("Deploying {} to Proxmox...", file.display());
             let content = fs::read_to_string(file)?;
-            let yaml = converter::convert_dockerfile_to_distrobuilder(&content);
+            let _yaml = converter::convert_dockerfile_to_distrobuilder(&content);
             
             println!("Successfully generated YAML, simulated deploy.");
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
