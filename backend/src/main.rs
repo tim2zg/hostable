@@ -152,13 +152,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .execute(pool)
                         .await
                         .unwrap();
-                        
-                    println!("\n=======================================================");
-                    println!("🚀 HOSTABLE INITIALIZED!");
-                    println!("🔐 Your Admin API Token is: {}", token_str);
-                    println!("Please save this token. You will need it to log in.");
-                    println!("=======================================================\n");
                 }
+                
+                let row: (String,) = sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(("unknown_token".to_string(),));
+                    
+                println!("\n=======================================================");
+                println!("🚀 HOSTABLE INITIALIZED!");
+                println!("🔐 Your Admin API Token is: {}", row.0);
+                println!("Please save this token. You will need it to log in.");
+                println!("=======================================================\n");
             } else {
                 println!("\n=======================================================");
                 println!("🚀 HOSTABLE INITIALIZED IN MOCK MODE!");
