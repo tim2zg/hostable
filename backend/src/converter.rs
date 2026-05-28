@@ -1,4 +1,44 @@
 
+use axum::{Json, response::IntoResponse, http::StatusCode};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+pub struct ConvertRequest {
+    pub dockerfile: String,
+}
+
+#[derive(Serialize)]
+pub struct ConvertResponse {
+    pub yaml: String,
+}
+
+pub async fn convert_dockerfile_endpoint(
+    Json(payload): Json<ConvertRequest>,
+) -> impl IntoResponse {
+    let yaml = convert_dockerfile_to_distrobuilder(&payload.dockerfile);
+    (StatusCode::OK, Json(ConvertResponse { yaml }))
+}
+
+#[derive(Serialize)]
+pub struct DeployResponse {
+    pub status: String,
+    pub message: String,
+}
+
+pub async fn deploy_lxc_endpoint(
+    Json(payload): Json<ConvertRequest>,
+) -> impl IntoResponse {
+    let _yaml = convert_dockerfile_to_distrobuilder(&payload.dockerfile);
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    (
+        StatusCode::OK,
+        Json(DeployResponse {
+            status: "ok".to_string(),
+            message: "Simulated LXC container deployment succeeded!".to_string(),
+        }),
+    )
+}
+
 pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
     let mut actions = Vec::new();
     let mut env_vars = Vec::new();
