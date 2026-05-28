@@ -9,6 +9,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, request::Parts},
     extract::{ws::{WebSocketUpgrade, WebSocket, Message}, FromRequestParts, FromRef, State, Path as AxumPath},
+    response::IntoResponse,
 };
 use tokio::time::{interval, Duration};
 use std::time::SystemTime;
@@ -19,10 +20,15 @@ use std::net::SocketAddr;
 use tracing_subscriber;
 use rand::distr::{Alphanumeric, SampleString};
 use std::sync::Arc;
+use rust_embed::RustEmbed;
 
 mod proxmox;
 mod converter;
 mod oci;
+
+#[derive(RustEmbed)]
+#[folder = "../frontend/dist/"]
+struct Assets;
 
 pub struct AppState {
     pub proxmox: proxmox::ProxmoxClient,
@@ -327,6 +333,14 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -
     let host_header = req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
     let domain = host_header.split(':').next().unwrap_or(host_header);
 
+    let is_ip_or_localhost = domain == "localhost" || domain == "127.0.0.1" || domain.parse::<std::net::IpAddr>().is_ok();
+    
+    if is_ip_or_localhost {
+        let res = static_handler(req.uri().clone()).await;
+        let (parts, body) = res.into_parts();
+        return Ok(Response::from_parts(parts, body));
+    }
+
     if let Some(pool) = &state.pool {
         let rule = sqlx::query("SELECT target_ip, target_port, auth_enabled FROM proxy_rules WHERE domain = $1")
             .bind(domain)
@@ -401,6 +415,34 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -
         .status(StatusCode::NOT_FOUND)
         .body(Body::from(format!("Hostable Proxy: No routing rule found for domain '{}'", domain)))
         .unwrap())
+}
+
+async fn static_handler(uri: axum::http::Uri) -> axum::response::Response {
+    let mut path = uri.path().trim_start_matches('/').to_string();
+
+    if path.is_empty() {
+        path = "index.html".to_string();
+    }
+
+    match Assets::get(&path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            ([(axum::http::header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => {
+            if path.starts_with("api/") {
+                return (StatusCode::NOT_FOUND, "API route not found").into_response();
+            }
+            // Fallback to index.html for SPA routing
+            match Assets::get("index.html") {
+                Some(content) => {
+                    let mime = mime_guess::from_path("index.html").first_or_octet_stream();
+                    ([(axum::http::header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+                }
+                None => (StatusCode::NOT_FOUND, "Hostable UI not bundled").into_response(),
+            }
+        }
+    }
 }
 
 async fn get_catalog(_auth: RequireAuth) -> Json<Value> {

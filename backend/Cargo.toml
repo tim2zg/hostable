@@ -19,3 +19,5 @@ serde_yaml = "0.9.34"
 axum = { version = "0.8", features = ["ws"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros"] }
 dotenvy = "0.15"
+rust-embed = "8.5"
+mime_guess = "2.0"
