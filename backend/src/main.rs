@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/api/db/execute", post(db_execute))
                 .route("/api/db/schema", get(db_schema))
                 .route("/api/ws/logs/:vmid", get(ws_logs_handler))
+                .route("/api/catalog", get(get_catalog))
                 .fallback(any(proxy_handler))
                 .with_state(shared_state);
 
@@ -400,6 +401,22 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -
         .status(StatusCode::NOT_FOUND)
         .body(Body::from(format!("Hostable Proxy: No routing rule found for domain '{}'", domain)))
         .unwrap())
+}
+
+async fn get_catalog(_auth: RequireAuth) -> Json<Value> {
+    let url = "https://api.linuxserver.io/api/v1/images?include_config=false&include_deprecated=false";
+    match reqwest::get(url).await {
+        Ok(res) => {
+            if let Ok(json) = res.json::<Value>().await {
+                Json(json)
+            } else {
+                Json(json!({"status": "error", "error": "Failed to parse catalog JSON"}))
+            }
+        }
+        Err(e) => {
+            Json(json!({"status": "error", "error": e.to_string()}))
+        }
+    }
 }
 
 async fn verify_token(_auth: RequireAuth) -> Json<Value> {

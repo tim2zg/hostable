@@ -3,6 +3,7 @@
   import Dashboard from './lib/Dashboard.svelte';
   import LxcManager from './lib/LxcManager.svelte';
   import Converter from './lib/Converter.svelte';
+  import Catalog from './lib/Catalog.svelte';
   import ProxyRouter from './lib/ProxyRouter.svelte';
   import LogViewer from './lib/LogViewer.svelte';
   import DatabaseManager from './lib/DatabaseManager.svelte';
@@ -83,10 +84,16 @@
         LXC Manager
       </div>
       <div 
+        class="nav-item {currentView === 'catalog' ? 'active' : ''}"
+        on:click={() => setView('catalog')}
+      >
+        Catalog (1-Click)
+      </div>
+      <div 
         class="nav-item {currentView === 'converter' ? 'active' : ''}"
         on:click={() => setView('converter')}
       >
-        1-Click Deploy
+        Custom Deploy
       </div>
       <div 
         class="nav-item {currentView === 'proxy' ? 'active' : ''}"
@@ -117,6 +124,8 @@
       <LxcManager />
     {:else if currentView === 'converter'}
       <Converter />
+    {:else if currentView === 'catalog'}
+      <Catalog />
     {:else if currentView === 'proxy'}
       <ProxyRouter />
     {:else if currentView === 'logs'}
