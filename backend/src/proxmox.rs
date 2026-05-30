@@ -35,52 +35,79 @@ impl ProxmoxClient {
         format!("PVEAPIToken={}={}", self.token_id, self.token_secret)
     }
 
-    pub async fn get_cluster_resources(&self) -> Result<serde_json::Value, reqwest::Error> {
-        let url = format!("{}/cluster/resources", self.base_url);
+    async fn handle_response(url: &str, res: reqwest::Response) -> Result<serde_json::Value, String> {
+        let status = res.status();
+        let text = res.text().await.map_err(|e| format!("Failed to read response text: {}", e))?;
         
-        let res = self.client.get(&url)
-            .header("Authorization", self.auth_header())
-            .send()
-            .await?;
-            
-        res.json().await
+        tracing::debug!("Proxmox API {} - Status: {} - Response: {}", url, status, text);
+        
+        if !status.is_success() {
+            tracing::error!("Proxmox API Request Failed! URL: {} Status: {} Response: {}", url, status, text);
+            // It might not be JSON, but let's try to parse it anyway or just return the text inside JSON.
+            match serde_json::from_str(&text) {
+                Ok(json) => return Ok(json),
+                Err(_) => return Err(format!("Proxmox returned {}: {}", status, text)),
+            }
+        }
+        
+        serde_json::from_str(&text).map_err(|e| format!("Failed to parse JSON (Status: {}): {} \nRaw Text: {}", status, e, text))
     }
 
-    pub async fn get_nodes(&self) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn get_cluster_resources(&self) -> Result<serde_json::Value, String> {
+        let url = format!("{}/cluster/resources", self.base_url);
+        tracing::info!("GET {}", url);
+        
+        let res = self.client.get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        Self::handle_response(&url, res).await
+    }
+
+    pub async fn get_nodes(&self) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes", self.base_url);
+        tracing::info!("GET {}", url);
         
         let res = self.client.get(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
             
-        res.json().await
+        Self::handle_response(&url, res).await
     }
     
-    pub async fn get_node_status(&self, node: &str) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn get_node_status(&self, node: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/status", self.base_url, node);
+        tracing::info!("GET {}", url);
         
         let res = self.client.get(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
             
-        res.json().await
+        Self::handle_response(&url, res).await
     }
     
-    pub async fn get_lxcs(&self, node: &str) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn get_lxcs(&self, node: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/lxc", self.base_url, node);
+        tracing::info!("GET {}", url);
         
         let res = self.client.get(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
             
-        res.json().await
+        Self::handle_response(&url, res).await
     }
 
     pub async fn upload_template(&self, node: &str, storage: &str, file_path: &std::path::Path, filename: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/storage/{}/upload", self.base_url, node, storage);
+        tracing::info!("POST {}", url);
         
         let file_bytes = tokio::fs::read(file_path).await.map_err(|e| e.to_string())?;
         
@@ -100,45 +127,53 @@ impl ProxmoxClient {
             .await
             .map_err(|e| e.to_string())?;
             
-        res.json().await.map_err(|e| e.to_string())
+        Self::handle_response(&url, res).await
     }
 
-    pub async fn create_lxc(&self, node: &str, vmid: u32, params: std::collections::HashMap<String, String>) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn create_lxc(&self, node: &str, vmid: u32, params: std::collections::HashMap<String, String>) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/lxc", self.base_url, node);
+        tracing::info!("POST {} with params: {:?}", url, params);
         
         let res = self.client.post(&url)
             .header("Authorization", self.auth_header())
             .json(&params)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
             
-        res.json().await
+        Self::handle_response(&url, res).await
     }
 
-    pub async fn stop_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn stop_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/lxc/{}/status/stop", self.base_url, node, vmid);
+        tracing::info!("POST {}", url);
         let res = self.client.post(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
-        res.json().await
+            .await
+            .map_err(|e| e.to_string())?;
+        Self::handle_response(&url, res).await
     }
 
-    pub async fn start_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn start_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/lxc/{}/status/start", self.base_url, node, vmid);
+        tracing::info!("POST {}", url);
         let res = self.client.post(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
-        res.json().await
+            .await
+            .map_err(|e| e.to_string())?;
+        Self::handle_response(&url, res).await
     }
 
-    pub async fn delete_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, reqwest::Error> {
+    pub async fn delete_lxc(&self, node: &str, vmid: u32) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes/{}/lxc/{}", self.base_url, node, vmid);
+        tracing::info!("DELETE {}", url);
         let res = self.client.delete(&url)
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
-        res.json().await
+            .await
+            .map_err(|e| e.to_string())?;
+        Self::handle_response(&url, res).await
     }
 }

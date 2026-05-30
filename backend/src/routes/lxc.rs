@@ -12,7 +12,10 @@ use std::env;
 use crate::{AppState, RequireAuth};
 
 pub async fn get_lxcs(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| {
+        tracing::error!("Failed to fetch cluster resources: {}", e);
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
     let mut mapped = Vec::new();
     
     if let Some(data) = resources["data"].as_array() {

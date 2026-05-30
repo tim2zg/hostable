@@ -467,7 +467,10 @@ async fn health_check() -> Json<Value> {
 }
 
 pub async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
-    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let resources = state.proxmox.get_cluster_resources().await.map_err(|e| {
+        tracing::error!("Failed to fetch cluster resources: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
     
     let mut total_cpu = 0.0;
     let mut total_mem_used = 0.0;
