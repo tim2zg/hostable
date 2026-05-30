@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { apiGet, getToken } from './api';
 
   type Lxc = { id: number, name: string, status: string };
   let containers: Lxc[] = [];
@@ -14,13 +15,10 @@
 
   async function fetchContainers() {
     try {
-      const res = await fetch('/api/lxcs');
-      if (res.ok) {
-        containers = await res.json();
-        if (containers.length > 0) {
-          selectedVmid = containers[0].id.toString();
-          connectWebSocket();
-        }
+      containers = await apiGet('/lxcs');
+      if (containers.length > 0) {
+        selectedVmid = containers[0].id.toString();
+        connectWebSocket();
       }
     } catch (err) {
       console.error("Failed to load containers for log viewer", err);
@@ -35,7 +33,7 @@
     if (!selectedVmid || isPaused) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//127.0.0.1:3000/api/ws/logs/${selectedVmid}`);
+    ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/logs/${selectedVmid}?token=${getToken()}`);
 
     ws.onmessage = (event) => {
       if (!isPaused) {

@@ -83,6 +83,12 @@ body {
 }
 
 .nav-item {
+  appearance: none;
+  background: transparent;
+  border: none;
+  text-align: left;
+  font-family: inherit;
+  width: 100%;
   padding: 0.8rem 1.2rem;
   border-radius: 6px;
   color: var(--text-secondary);

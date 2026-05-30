@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { apiGet, apiPost } from './api';
 
   let tables: string[] = [];
   let sqlQuery = "";
@@ -10,16 +11,10 @@
 
   async function fetchSchema() {
     try {
-      const res = await fetch('/api/db/schema');
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'ok' || data.status === 'mock') {
+      const data = await apiGet('/db/schema');
+      if (data.status === 'ok' || data.status === 'mock') {
           tables = data.tables || [];
-        } else {
-          statusMessage = "Failed to load database schema: " + (data.error || "Unknown error");
-          statusType = 'error';
         }
-      }
     } catch (err) {
       console.error(err);
       statusMessage = "Network error loading database schema.";
@@ -35,15 +30,9 @@
     rowsAffected = null;
 
     try {
-      const res = await fetch('/api/db/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sql: sqlQuery })
-      });
+      const data = await apiPost('/db/execute', { sql: sqlQuery });
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'ok') {
+      if (data.status === 'ok') {
           statusMessage = "Query executed successfully!";
           statusType = 'success';
           rowsAffected = data.rows_affected;
@@ -51,14 +40,7 @@
         } else if (data.status === 'mock') {
           statusMessage = `Mock Mode: query would execute successfully. (${data.message})`;
           statusType = 'success';
-        } else {
-          statusMessage = "SQL Error: " + (data.error || "Execution failed.");
-          statusType = 'error';
         }
-      } else {
-        statusMessage = "Server returned an error status.";
-        statusType = 'error';
-      }
     } catch (err) {
       statusMessage = "Error: " + err;
       statusType = 'error';

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { apiGet, apiPost } from './api';
 
   let images: any[] = [];
   let loading = true;
@@ -24,9 +25,7 @@
 
   onMount(async () => {
     try {
-      const res = await fetch('/api/catalog');
-      if (!res.ok) throw new Error('Failed to fetch catalog');
-      const json = await res.json();
+      const json = await apiGet('/catalog');
       
       if (json.data && json.data.repositories && json.data.repositories.linuxserver) {
         images = json.data.repositories.linuxserver.filter((img: any) => !img.deprecated);
@@ -86,14 +85,7 @@
       deployStatus = 'Deploying LXC Container (this may take a minute)...';
       deployProgress = 60;
 
-      const deployRes = await fetch('/api/deploy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      
-      const responseData = await deployRes.json();
-      if (!deployRes.ok) throw new Error(responseData.message || 'Deployment failed');
+      const responseData = await apiPost('/deploy', payload);
       
       deployStatus = 'Success! Container deployed and starting.';
       deployProgress = 100;
