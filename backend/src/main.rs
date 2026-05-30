@@ -95,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     tracing_subscriber::fmt::init();
     dotenvy::dotenv().ok();
+    dotenvy::from_path("/etc/hostable/.env").ok();
 
     match &cli.command {
         Commands::Start => {
