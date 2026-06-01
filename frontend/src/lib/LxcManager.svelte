@@ -20,6 +20,13 @@
   let xterm: Terminal | null = null;
   let fitAddon: FitAddon | null = null;
 
+  // Metrics State
+  import Chart from 'chart.js/auto';
+  let activeMetricsId: number | null = null;
+  let metricsChartCanvas: HTMLCanvasElement;
+  let metricsChartInstance: any = null;
+  let metricsError = '';
+
   async function fetchContainers() {
     isFetching = true;
     try {
@@ -108,11 +115,13 @@
         ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/${id}?token=${localStorage.getItem('hostable_token')}`);
         
         ws.onmessage = (event) => {
-          xterm?.write(event.data);
+          if (xterm) {
+            xterm.write(event.data);
+          }
         };
 
         ws.onclose = () => {
-          xterm?.write("\r\n\x1b[31m[Console disconnected]\x1b[0m\r\n");
+          if (xterm) xterm.write('\r\n\x1b[31m[Connection Closed]\x1b[0m\r\n');
         };
 
         // Send keystrokes directly to WebSocket
@@ -145,6 +154,72 @@
     }
     window.removeEventListener('resize', handleResize);
     activeConsoleId = null;
+  }
+
+  async function showMetrics(id: number) {
+    activeMetricsId = id;
+    metricsError = '';
+    try {
+      const res = await apiGet(`/lxcs/${id}/rrddata`);
+      setTimeout(() => {
+        if (!metricsChartCanvas) return;
+        
+        if (metricsChartInstance) metricsChartInstance.destroy();
+
+        if (res.message && res.message.includes('Permission check failed')) {
+            metricsError = "Missing 'Sys.Audit' permission for this container. Update your API Token.";
+            return;
+        }
+
+        if (!res.data || res.data.length === 0) {
+            metricsError = "No telemetry data available for this container yet.";
+            return;
+        }
+
+        const validData = res.data.filter((d: any) => d.cpu !== undefined && d.cpu !== null);
+        const labels = validData.map((d: any) => {
+          const date = new Date(d.time * 1000);
+          return `${date.getHours()}:${date.getMinutes().toString().padStart(2, '0')}`;
+        });
+        
+        const cpuData = validData.map((d: any) => (d.cpu * 100).toFixed(1));
+        const ramData = validData.map((d: any) => {
+          if (d.memused && d.memtotal) return ((d.memused / d.memtotal) * 100).toFixed(1);
+          return 0;
+        });
+
+        metricsChartInstance = new Chart(metricsChartCanvas, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [
+              { label: 'CPU Usage (%)', data: cpuData, borderColor: '#38bdf8', backgroundColor: 'rgba(56, 189, 248, 0.15)', fill: true, tension: 0.4 },
+              { label: 'RAM Usage (%)', data: ramData, borderColor: '#c084fc', backgroundColor: 'rgba(192, 132, 252, 0.15)', fill: true, tension: 0.4 }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+              y: { beginAtZero: true, max: 100, grid: { color: '#334155' } },
+              x: { grid: { display: false } }
+            },
+            plugins: { legend: { labels: { color: '#e2e8f0' } } }
+          }
+        });
+      }, 100);
+    } catch(err: any) {
+      metricsError = "Failed to fetch telemetry data.";
+    }
+  }
+
+  function closeMetrics() {
+    activeMetricsId = null;
+    if (metricsChartInstance) {
+      metricsChartInstance.destroy();
+      metricsChartInstance = null;
+    }
   }
 
   onMount(() => {
@@ -392,6 +467,7 @@
           
           <div class="actions">
             {#if ct.status === 'running'}
+              <button class="flat-btn-outline" title="View Telemetry Metrics" on:click={() => showMetrics(ct.id)}>📊 Metrics</button>
               <button class="flat-btn-outline" title="Stop Instance" on:click={() => stopContainer(ct.id)}>⏹ Stop</button>
               <button class="flat-btn-outline" title="Restart Instance" on:click={() => restartContainer(ct.id)}>🔄 Restart</button>
               <button class="flat-btn-primary" title="Open Web Terminal Console" on:click={() => openConsole(ct.id)}>💻 Console</button>
@@ -404,7 +480,6 @@
         <div class="lxc-stats">
           <div class="stat"><span>RAM Limit:</span> {ct.mem}</div>
           <div class="stat"><span>CPU Shares:</span> {ct.cpu}</div>
-          <div class="stat"><span>Node:</span> pve</div>
         </div>
       </div>
     {/each}
@@ -412,7 +487,9 @@
 
   <!-- Interactive Terminal Console Modal -->
   {#if activeConsoleId}
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="modal-backdrop" on:click={closeConsole}>
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
       <div class="terminal-window" on:click|stopPropagation>
         <div class="terminal-header">
           <div style="display: flex; align-items: center; gap: 0.5rem;">
@@ -422,6 +499,33 @@
           <button class="close-btn" on:click={closeConsole}>×</button>
         </div>
         <div class="terminal-body" bind:this={terminalRef}></div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Metrics Modal -->
+  {#if activeMetricsId}
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-backdrop" on:click={closeMetrics}>
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="terminal-window" style="background: #0f172a;" on:click|stopPropagation>
+        <div class="terminal-header">
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <span>📊 Container #{activeMetricsId} Telemetry (Last Hour)</span>
+          </div>
+          <button class="close-btn" on:click={closeMetrics}>×</button>
+        </div>
+        <div style="padding: 1.5rem; height: calc(100% - 60px); display: flex; flex-direction: column;">
+          {#if metricsError}
+            <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid #f59e0b; color: #fbbf24; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.95rem; display: flex; align-items: center; gap: 0.8rem;">
+              <span style="font-size: 1.2rem;">⚠️</span>
+              {metricsError}
+            </div>
+          {/if}
+          <div style="flex: 1; position: relative;" style:opacity={metricsError ? '0.3' : '1'}>
+            <canvas bind:this={metricsChartCanvas}></canvas>
+          </div>
+        </div>
       </div>
     </div>
   {/if}

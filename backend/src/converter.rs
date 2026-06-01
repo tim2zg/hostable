@@ -45,7 +45,7 @@ pub async fn deploy_lxc_endpoint(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
     Json(payload): Json<DeployRequest>,
 ) -> impl IntoResponse {
-    let node = "pve";
+    let node = state.default_node.clone();
     
     // 1. Process DB Provisioning
     let mut final_envs = payload.env_vars.clone();
@@ -80,7 +80,7 @@ pub async fn deploy_lxc_endpoint(
     match extractor.extract_to_dir(&payload.image, &out_path, Some(&final_envs)).await {
         Ok(_) => {
             // 3. Upload to Proxmox
-            match state.proxmox.upload_template(node, &payload.template_storage, &out_path, &filename).await {
+            match state.proxmox.upload_template(&node, &payload.template_storage, &out_path, &filename).await {
                 Ok(_) => {
                     // 4. Create LXC
                     let mut params = std::collections::HashMap::new();
@@ -117,10 +117,10 @@ pub async fn deploy_lxc_endpoint(
                         }
                     }
 
-                    match state.proxmox.create_lxc(node, payload.vmid, params).await {
+                    match state.proxmox.create_lxc(&node, payload.vmid, params).await {
                         Ok(_) => {
                             tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                            let _ = state.proxmox.start_lxc(node, payload.vmid).await;
+                            let _ = state.proxmox.start_lxc(&node, payload.vmid).await;
                             
                             (StatusCode::OK, Json(DeployResponse {
                                 status: "ok".to_string(),

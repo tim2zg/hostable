@@ -66,6 +66,22 @@ impl ProxmoxClient {
         Self::handle_response(&url, res).await
     }
 
+    pub async fn get_default_node(&self) -> String {
+        if let Ok(val) = env::var("PROXMOX_NODE") {
+            return val;
+        }
+        if let Ok(nodes) = self.get_nodes().await {
+            if let Some(data) = nodes["data"].as_array() {
+                if let Some(first) = data.first() {
+                    if let Some(node_name) = first["node"].as_str() {
+                        return node_name.to_string();
+                    }
+                }
+            }
+        }
+        "pve".to_string()
+    }
+
     pub async fn get_nodes(&self) -> Result<serde_json::Value, String> {
         let url = format!("{}/nodes", self.base_url);
         tracing::info!("GET {}", url);

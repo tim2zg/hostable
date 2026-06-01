@@ -35,6 +35,7 @@ pub struct AppState {
     pub proxmox: proxmox::ProxmoxClient,
     pub pool: Option<sqlx::PgPool>,
     pub catalog_cache: tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>,
+    pub default_node: String,
 }
 
 #[derive(Parser)]
@@ -148,10 +149,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("=======================================================\n");
             }
 
+            let proxmox_client = proxmox::ProxmoxClient::new();
+            let default_node = proxmox_client.get_default_node().await;
+
             let shared_state = Arc::new(AppState {
-                proxmox: proxmox::ProxmoxClient::new(),
+                proxmox: proxmox_client,
                 pool: _pool,
                 catalog_cache: tokio::sync::RwLock::new(None),
+                default_node,
             });
 
             let cors = CorsLayer::new()
@@ -240,22 +245,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match extractor.extract_to_dir(image, out, None).await {
                 Ok(status) => {
                     let proxmox = proxmox::ProxmoxClient::new();
-                    let node = "pve";
+                    let node = proxmox.get_default_node().await;
                     match status {
                         oci::UpdateStatus::Unchanged => {
                             println!("Image has not changed. No update needed for container {}.", vmid);
                         },
                         oci::UpdateStatus::InPlaceUpdate => {
                             println!("In-place update detected. Restarting container {}...", vmid);
-                            let _ = proxmox.stop_lxc(node, *vmid).await;
+                            let _ = proxmox.stop_lxc(&node, *vmid).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            let _ = proxmox.start_lxc(node, *vmid).await;
+                            let _ = proxmox.start_lxc(&node, *vmid).await;
                         },
                         oci::UpdateStatus::Recreated => {
                             println!("Base image changed. Recreating container {}...", vmid);
-                            let _ = proxmox.stop_lxc(node, *vmid).await;
+                            let _ = proxmox.stop_lxc(&node, *vmid).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            let _ = proxmox.delete_lxc(node, *vmid).await;
+                            let _ = proxmox.delete_lxc(&node, *vmid).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             let mut params = std::collections::HashMap::new();
                             params.insert("vmid".to_string(), vmid.to_string());
@@ -266,9 +271,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             params.insert("storage".to_string(), "local-lvm".to_string());
                             params.insert("rootfs".to_string(), "local-lvm:8".to_string());
                             params.insert("tags".to_string(), "hostable".to_string());
-                            let _ = proxmox.create_lxc(node, *vmid, params).await;
+                            let _ = proxmox.create_lxc(&node, *vmid, params).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            let _ = proxmox.start_lxc(node, *vmid).await;
+                            let _ = proxmox.start_lxc(&node, *vmid).await;
                         }
                     }
                 },
@@ -290,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Loaded {} deployments. Interval: {} seconds.", cfg.deployments.len(), cfg.interval_seconds);
 
             let proxmox = proxmox::ProxmoxClient::new();
-            let node = "pve";
+            let node = proxmox.get_default_node().await;
 
             loop {
                 println!("--- Checking for updates ---");
@@ -306,15 +311,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                                 oci::UpdateStatus::InPlaceUpdate => {
                                     println!("VMID {}: In-place update detected. Restarting...", dep.vmid);
-                                    let _ = proxmox.stop_lxc(node, dep.vmid).await;
+                                    let _ = proxmox.stop_lxc(&node, dep.vmid).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                    let _ = proxmox.start_lxc(node, dep.vmid).await;
+                                    let _ = proxmox.start_lxc(&node, dep.vmid).await;
                                 },
                                 oci::UpdateStatus::Recreated => {
                                     println!("VMID {}: Base layers changed. Recreating...", dep.vmid);
-                                    let _ = proxmox.stop_lxc(node, dep.vmid).await;
+                                    let _ = proxmox.stop_lxc(&node, dep.vmid).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                    let _ = proxmox.delete_lxc(node, dep.vmid).await;
+                                    let _ = proxmox.delete_lxc(&node, dep.vmid).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                     let mut params = std::collections::HashMap::new();
                                     params.insert("vmid".to_string(), dep.vmid.to_string());
@@ -325,9 +330,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     params.insert("storage".to_string(), "local-lvm".to_string());
                                     params.insert("rootfs".to_string(), "local-lvm:8".to_string());
                                     params.insert("tags".to_string(), "hostable".to_string());
-                                    let _ = proxmox.create_lxc(node, dep.vmid, params).await;
+                                    let _ = proxmox.create_lxc(&node, dep.vmid, params).await;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                    let _ = proxmox.start_lxc(node, dep.vmid).await;
+                                    let _ = proxmox.start_lxc(&node, dep.vmid).await;
                                 }
                             }
                         },
@@ -469,7 +474,7 @@ async fn health_check() -> Json<Value> {
 }
 
 pub async fn get_storages_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     match state.proxmox.get_storages(&node).await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e))
@@ -477,7 +482,7 @@ pub async fn get_storages_handler(_auth: RequireAuth, State(state): State<Arc<Ap
 }
 
 pub async fn rrddata_node_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     match state.proxmox.get_rrddata(&node, None, "hour").await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e))

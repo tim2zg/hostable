@@ -32,11 +32,15 @@
       const res = await apiGet('/node/rrddata');
       if (res && res.data) {
         updateChart(res.data);
+      } else if (res && res.message && res.message.includes('Permission check failed')) {
+        chartError = "Missing 'Sys.Audit' permission on /nodes/pve. Please update your Proxmox API Token.";
       }
     } catch (err) {
       console.error("Failed to fetch rrd data", err);
     }
   }
+
+  let chartError = "";
 
   function updateChart(rrdData: any[]) {
     if (!chartCanvas) return;
@@ -289,8 +293,16 @@
 
   <!-- Historical Telemetry Graph -->
   <div class="chart-card">
-    <h3>📈 Node Telemetry (Last Hour)</h3>
-    <div class="chart-container">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+      <h3 style="margin: 0;">📈 Node Telemetry (Last Hour)</h3>
+    </div>
+    {#if chartError}
+      <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid #f59e0b; color: #fbbf24; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.95rem; display: flex; align-items: center; gap: 0.8rem;">
+        <span style="font-size: 1.2rem;">⚠️</span>
+        {chartError}
+      </div>
+    {/if}
+    <div class="chart-container" style={chartError ? 'opacity: 0.3; pointer-events: none;' : ''}>
       <canvas bind:this={chartCanvas}></canvas>
     </div>
   </div>

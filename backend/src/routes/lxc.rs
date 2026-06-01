@@ -50,7 +50,7 @@ pub async fn get_lxcs(_auth: RequireAuth, State(state): State<Arc<AppState>>) ->
 }
 
 pub async fn start_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>, Path(vmid): Path<u32>) -> Json<Value> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     match state.proxmox.start_lxc(&node, vmid).await {
         Ok(_) => Json(json!({"status": "ok"})),
         Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
@@ -58,7 +58,7 @@ pub async fn start_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppSt
 }
 
 pub async fn stop_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>, Path(vmid): Path<u32>) -> Json<Value> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     match state.proxmox.stop_lxc(&node, vmid).await {
         Ok(_) => Json(json!({"status": "ok"})),
         Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
@@ -66,7 +66,7 @@ pub async fn stop_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppSta
 }
 
 pub async fn restart_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>, Path(vmid): Path<u32>) -> Json<Value> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     let _ = state.proxmox.stop_lxc(&node, vmid).await;
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     match state.proxmox.start_lxc(&node, vmid).await {
@@ -76,7 +76,7 @@ pub async fn restart_lxc_handler(_auth: RequireAuth, State(state): State<Arc<App
 }
 
 pub async fn rrddata_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>, Path(vmid): Path<u32>) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    let node = state.default_node.clone();
     match state.proxmox.get_rrddata(&node, Some(vmid), "hour").await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))
