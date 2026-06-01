@@ -9,6 +9,7 @@
   import DatabaseManager from './lib/DatabaseManager.svelte';
   import Login from './lib/Login.svelte';
   import Settings from './lib/Settings.svelte';
+  import ToastRenderer from './lib/ToastRenderer.svelte';
   import { onMount, onDestroy } from 'svelte';
   import { apiGet } from './lib/api';
 
@@ -102,4 +103,5 @@
     {/if}
   </main>
 </div>
+<ToastRenderer />
 {/if}

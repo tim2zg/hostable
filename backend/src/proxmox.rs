@@ -176,4 +176,19 @@ impl ProxmoxClient {
             .map_err(|e| e.to_string())?;
         Self::handle_response(&url, res).await
     }
+
+    pub async fn get_rrddata(&self, node: &str, vmid: Option<u32>, timeframe: &str) -> Result<serde_json::Value, String> {
+        let url = if let Some(id) = vmid {
+            format!("{}/nodes/{}/lxc/{}/rrddata?timeframe={}", self.base_url, node, id, timeframe)
+        } else {
+            format!("{}/nodes/{}/rrddata?timeframe={}", self.base_url, node, timeframe)
+        };
+        tracing::info!("GET {}", url);
+        let res = self.client.get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        Self::handle_response(&url, res).await
+    }
 }

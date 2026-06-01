@@ -5,9 +5,13 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
-use std::time::SystemTime;
 use std::env;
+use tokio::process::Command;
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use futures::{stream::StreamExt, SinkExt};
+use tokio::sync::mpsc;
 
 use crate::{AppState, RequireAuth};
 
@@ -71,24 +75,91 @@ pub async fn restart_lxc_handler(_auth: RequireAuth, State(state): State<Arc<App
     }
 }
 
+pub async fn rrddata_lxc_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>, Path(vmid): Path<u32>) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    match state.proxmox.get_rrddata(&node, Some(vmid), "hour").await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
+}
+
 pub async fn ws_logs_handler(_auth: RequireAuth, Path(vmid): Path<String>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_log_socket(socket, vmid))
 }
 
-async fn handle_log_socket(mut socket: WebSocket, vmid: String) {
-    let mut ticker = interval(Duration::from_secs(1));
-    let mut iterations = 0;
-    loop {
-        ticker.tick().await;
-        iterations += 1;
-        if iterations > 300 {
-            let _ = socket.send(Message::Text("[Hostable] Connection auto-closed: Session limit of 5 minutes reached to save server resources.".into())).await;
-            break;
+async fn handle_log_socket(socket: WebSocket, vmid: String) {
+    let (mut sender, mut receiver) = socket.split();
+    
+    // Check if mock mode is active
+    if std::env::var("PROXMOX_MOCK").is_ok() {
+        let _ = sender.send(Message::Text("Mock mode active. Terminal unavailable.\r\n".into())).await;
+        return;
+    }
+
+    let mut child = match Command::new("pct")
+        .arg("exec")
+        .arg(&vmid)
+        .arg("--")
+        .arg("/bin/bash")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = sender.send(Message::Text(format!("Failed to start shell: {}\r\n", e).into())).await;
+            return;
         }
-        let timestamp = SystemTime::now();
-        let msg = format!("[{}] VM {} log line", timestamp.elapsed().unwrap_or_default().as_secs(), vmid);
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
+    };
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    let (tx, mut rx) = mpsc::channel::<String>(100);
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+
+    // Read stdout
+    tokio::spawn(async move {
+        let mut buf = [0; 1024];
+        while let Ok(n) = stdout.read(&mut buf).await {
+            if n == 0 { break; }
+            if let Ok(s) = String::from_utf8(buf[..n].to_vec()) {
+                let _ = tx_out.send(s).await;
+            }
+        }
+    });
+
+    // Read stderr
+    tokio::spawn(async move {
+        let mut buf = [0; 1024];
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 { break; }
+            if let Ok(s) = String::from_utf8(buf[..n].to_vec()) {
+                let _ = tx_err.send(s).await;
+            }
+        }
+    });
+
+    // Forward to WebSocket
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Read from WebSocket and send to stdin
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Text(text) = msg {
+            if stdin.write_all(text.as_bytes()).await.is_err() {
+                break;
+            }
         }
     }
+    
+    let _ = child.kill().await;
 }

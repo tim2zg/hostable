@@ -164,9 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/api/health", get(health_check))
                 .route("/api/stats", get(get_stats))
                 .route("/api/lxcs", get(routes::lxc::get_lxcs))
-                .route("/api/lxc/{vmid}/start", post(routes::lxc::start_lxc_handler))
-                .route("/api/lxc/{vmid}/stop", post(routes::lxc::stop_lxc_handler))
-                .route("/api/lxc/{vmid}/restart", post(routes::lxc::restart_lxc_handler))
+                .route("/api/lxcs/:vmid/restart", post(routes::lxc::restart_lxc_handler))
+                .route("/api/lxcs/:vmid/rrddata", get(routes::lxc::rrddata_lxc_handler))
+                .route("/api/ws/logs/:vmid", get(routes::lxc::ws_logs_handler))
+                .route("/api/node/rrddata", get(rrddata_node_handler))
                 .route("/api/proxy-rules", get(routes::proxy::get_proxy_rules).post(routes::proxy::add_proxy_rule))
                 .route("/api/proxy-rules/{id}", delete(routes::proxy::delete_proxy_rule))
                 .route("/api/convert", post(converter::convert_dockerfile_endpoint))
@@ -465,6 +466,14 @@ async fn verify_token(_auth: RequireAuth) -> Json<Value> {
 
 async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok", "message": "Hostable Proxmox Server is running!"}))
+}
+
+pub async fn rrddata_node_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    match state.proxmox.get_rrddata(&node, None, "hour").await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
 }
 
 pub async fn get_stats(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
