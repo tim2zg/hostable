@@ -98,7 +98,19 @@ pub async fn deploy_lxc_endpoint(
                     // Map Volumes
                     for (i, vol) in payload.volumes.iter().enumerate() {
                         let parts: Vec<&str> = vol.split(':').collect();
-                        if parts.len() >= 2 {
+                        if parts.len() == 4 && parts[0] == "storage" {
+                            // format: storage:storage_name:size_gb:container_path
+                            let storage_name = parts[1];
+                            let size_gb = parts[2];
+                            let container_path = parts[3];
+                            params.insert(format!("mp{}", i), format!("{}:{},mp={}", storage_name, size_gb, container_path));
+                        } else if parts.len() == 3 && parts[0] == "bind" {
+                            // format: bind:host_path:container_path
+                            let host_path = parts[1];
+                            let container_path = parts[2];
+                            params.insert(format!("mp{}", i), format!("{},mp={}", host_path, container_path));
+                        } else if parts.len() == 2 {
+                            // format: host_path:container_path (fallback/legacy)
                             let host_path = parts[0];
                             let container_path = parts[1];
                             params.insert(format!("mp{}", i), format!("{},mp={}", host_path, container_path));

@@ -191,4 +191,17 @@ impl ProxmoxClient {
             .map_err(|e| e.to_string())?;
         Self::handle_response(&url, res).await
     }
+
+    pub async fn get_storages(&self, node: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}/nodes/{}/storage", self.base_url, node);
+        tracing::info!("GET {}", url);
+        
+        let res = self.client.get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        Self::handle_response(&url, res).await
+    }
 }

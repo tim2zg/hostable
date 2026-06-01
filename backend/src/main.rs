@@ -168,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/api/lxcs/:vmid/rrddata", get(routes::lxc::rrddata_lxc_handler))
                 .route("/api/ws/logs/:vmid", get(routes::lxc::ws_logs_handler))
                 .route("/api/node/rrddata", get(rrddata_node_handler))
+                .route("/api/node/storages", get(get_storages_handler))
                 .route("/api/proxy-rules", get(routes::proxy::get_proxy_rules).post(routes::proxy::add_proxy_rule))
                 .route("/api/proxy-rules/{id}", delete(routes::proxy::delete_proxy_rule))
                 .route("/api/convert", post(converter::convert_dockerfile_endpoint))
@@ -466,6 +467,14 @@ async fn verify_token(_auth: RequireAuth) -> Json<Value> {
 
 async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok", "message": "Hostable Proxmox Server is running!"}))
+}
+
+pub async fn get_storages_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+    let node = env::var("PROXMOX_NODE").unwrap_or_else(|_| "pve".to_string());
+    match state.proxmox.get_storages(&node).await {
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
 }
 
 pub async fn rrddata_node_handler(_auth: RequireAuth, State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {

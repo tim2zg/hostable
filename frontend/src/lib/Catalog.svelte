@@ -98,14 +98,20 @@
 
   let memory = '512';
   let envVars: {key: string, value: string}[] = [];
-  let volumes: {host: string, container: string}[] = [];
+  let volumes: any[] = [];
   let useHostableDb = false;
   let dbName = '';
   let templateStorage = 'local';
   let rootfsStorage = 'local-lvm';
+  let availableStorages: any[] = [];
 
   onMount(async () => {
     try {
+      const storageRes = await apiGet('/node/storages');
+      if (storageRes && storageRes.data) {
+        availableStorages = storageRes.data.filter((s: any) => s.content && s.content.includes('rootdir'));
+      }
+      
       const json = await apiGet('/catalog');
       
       if (json.data && json.data.repositories && json.data.repositories.linuxserver) {
@@ -132,7 +138,13 @@
     if (featured) {
       memory = app.defaultMemory || '512';
       envVars = app.wizard ? JSON.parse(JSON.stringify(app.wizard)) : [];
-      volumes = app.volumes ? JSON.parse(JSON.stringify(app.volumes)) : [];
+      let defaultStorage = availableStorages.length > 0 ? availableStorages[0].storage : 'local-lvm';
+      volumes = app.volumes ? JSON.parse(JSON.stringify(app.volumes)).map((v: any) => ({
+        ...v,
+        type: 'managed',
+        storage: defaultStorage,
+        size: 8
+      })) : [];
       useHostableDb = app.recommendDb || false;
     } else {
       memory = '512';
@@ -172,7 +184,14 @@
         template_storage: templateStorage,
         rootfs_storage: rootfsStorage,
         env_vars: envVars.filter(e => e.key).map(e => `${e.key}=${e.value}`),
-        volumes: volumes.filter(v => v.host).map(v => `${v.host}:${v.container}`),
+        volumes: volumes.map(v => {
+          if (v.type === 'managed' && v.storage) {
+            return `storage:${v.storage}:${v.size || 8}:${v.container}`;
+          } else if (v.host) {
+            return `bind:${v.host}:${v.container}`;
+          }
+          return '';
+        }).filter(v => v !== ''),
         use_hostable_db: useHostableDb,
         db_name: useHostableDb ? dbName : null,
       };
@@ -199,7 +218,10 @@
 
   function addEnv() { envVars = [...envVars, {key: '', value: ''}]; }
   function removeEnv(idx: number) { envVars = envVars.filter((_, i) => i !== idx); }
-  function addVol() { volumes = [...volumes, {host: '', container: ''}]; }
+  function addVol() { 
+    let defaultStorage = availableStorages.length > 0 ? availableStorages[0].storage : 'local-lvm';
+    volumes = [...volumes, {type: 'managed', storage: defaultStorage, size: 8, host: '', container: ''}]; 
+  }
   function removeVol(idx: number) { volumes = volumes.filter((_, i) => i !== idx); }
 </script>
 
@@ -580,10 +602,34 @@
           <div class="wizard-section">
             <h3>Storage Mounts</h3>
             {#each volumes as vol, i}
-              <div class="form-group" style="margin-bottom: 0.8rem;">
-                <label>{vol.label || vol.container}</label>
-                <input type="text" bind:value={vol.host} disabled={isDeploying} placeholder="/host/path" />
-                <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.2rem;">Mounts to: {vol.container} inside container</div>
+              <div class="form-group" style="margin-bottom: 1.2rem; padding-bottom: 1rem; border-bottom: 1px solid #334155;">
+                <label style="display: flex; justify-content: space-between; align-items: center;">
+                  <span>{vol.label || 'Volume ' + (i+1)} ({vol.container})</span>
+                  <select bind:value={vol.type} style="background: #1e293b; color: #e2e8f0; border: 1px solid #475569; padding: 0.3rem; border-radius: 4px;" disabled={isDeploying}>
+                    <option value="managed">Managed Storage Volume</option>
+                    <option value="bind">Host Bind Mount</option>
+                  </select>
+                </label>
+                
+                {#if vol.type === 'managed'}
+                  <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                    <div style="flex: 2;">
+                      <select bind:value={vol.storage} style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" disabled={isDeploying}>
+                        {#each availableStorages as s}
+                          <option value={s.storage}>{s.storage} ({s.type})</option>
+                        {/each}
+                      </select>
+                    </div>
+                    <div style="flex: 1; display: flex; align-items: center; gap: 0.5rem; background: #1e293b; border: 1px solid #475569; border-radius: 6px; padding: 0 0.5rem;">
+                      <input type="number" bind:value={vol.size} style="width: 100%; border: none; background: transparent; color: #fff; outline: none;" disabled={isDeploying} min="1"/>
+                      <span style="color: #94a3b8; font-size: 0.9rem;">GB</span>
+                    </div>
+                  </div>
+                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.3rem;">Proxmox will automatically provision a {vol.size || 8}GB virtual disk for this volume.</div>
+                {:else}
+                  <input type="text" bind:value={vol.host} disabled={isDeploying} placeholder="/host/path" style="margin-top: 0.5rem; width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box;" />
+                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.3rem;">Enter an absolute path on the Proxmox host.</div>
+                {/if}
               </div>
             {/each}
           </div>
@@ -610,10 +656,34 @@
             <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.85rem;" on:click={addVol} disabled={isDeploying}>+ Add</button>
           </label>
           {#each volumes as vol, i}
-            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.8rem;">
-              <input type="text" placeholder="/host/path" style="flex: 1; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" bind:value={vol.host} disabled={isDeploying} />
-              <input type="text" placeholder="/container/path" style="flex: 1; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" bind:value={vol.container} disabled={isDeploying} />
-              <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeVol(i)} disabled={isDeploying}>✖</button>
+            <div style="background: rgba(0,0,0,0.2); padding: 0.8rem; border-radius: 6px; margin-bottom: 0.8rem; border: 1px solid #334155;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                <select bind:value={vol.type} style="background: #1e293b; color: #e2e8f0; border: 1px solid #475569; padding: 0.3rem; border-radius: 4px;" disabled={isDeploying}>
+                  <option value="managed">Managed Storage Volume</option>
+                  <option value="bind">Host Bind Mount</option>
+                </select>
+                <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeVol(i)} disabled={isDeploying}>✖</button>
+              </div>
+              
+              <input type="text" placeholder="Container Mount Path (e.g. /config)" style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box; margin-bottom: 0.5rem;" bind:value={vol.container} disabled={isDeploying} />
+
+              {#if vol.type === 'managed'}
+                <div style="display: flex; gap: 0.5rem;">
+                  <div style="flex: 2;">
+                    <select bind:value={vol.storage} style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" disabled={isDeploying}>
+                      {#each availableStorages as s}
+                        <option value={s.storage}>{s.storage} ({s.type})</option>
+                      {/each}
+                    </select>
+                  </div>
+                  <div style="flex: 1; display: flex; align-items: center; gap: 0.5rem; background: #1e293b; border: 1px solid #475569; border-radius: 6px; padding: 0 0.5rem;">
+                    <input type="number" bind:value={vol.size} style="width: 100%; border: none; background: transparent; color: #fff; outline: none;" disabled={isDeploying} min="1"/>
+                    <span style="color: #94a3b8; font-size: 0.9rem;">GB</span>
+                  </div>
+                </div>
+              {:else}
+                <input type="text" placeholder="Host Path (e.g. /mnt/data)" style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box;" bind:value={vol.host} disabled={isDeploying} />
+              {/if}
             </div>
           {/each}
         </div>
