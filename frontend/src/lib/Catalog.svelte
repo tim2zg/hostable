@@ -3,107 +3,96 @@
   import { apiGet, apiPost } from './api';
   import { toasts } from './toast';
 
-  const featuredApps = [
+  type CatalogItem = {
+    name: string;
+    title: string;
+    category: string;
+    description: string;
+    logo: string;
+    defaultMemory: string;
+    variables: { key: string; label: string; default: string; type: string; help?: string }[];
+    images: string[];
+    volumes?: string[];
+  };
+
+  const catalogItems: CatalogItem[] = [
     {
-      name: 'nextcloud',
-      title: 'Nextcloud',
+      name: 'nextcloud-stack',
+      title: 'Nextcloud (with Postgres & Redis)',
       category: 'Productivity',
-      description: 'A safe home for all your data. Access & share your files, calendars, contacts, mail & more.',
+      description: 'A fully self-contained Nextcloud instance backed by PostgreSQL and Redis for optimal performance. Natively merged without Docker!',
       logo: 'https://upload.wikimedia.org/wikipedia/commons/6/60/Nextcloud_Logo.svg',
-      image: 'lscr.io/linuxserver/nextcloud:latest',
-      defaultMemory: '1024',
-      wizard: [
-        { key: 'PUID', label: 'User ID (PUID)', value: '1000' },
-        { key: 'PGID', label: 'Group ID (PGID)', value: '1000' },
-        { key: 'TZ', label: 'Timezone', value: 'Europe/London' },
+      defaultMemory: '2048',
+      variables: [
+        { key: 'DB_PASSWORD', label: 'Database Password', default: 'securepassword', type: 'password', help: 'Password for the PostgreSQL database' },
+        { key: 'ADMIN_USER', label: 'Nextcloud Admin User', default: 'admin', type: 'text' },
+        { key: 'ADMIN_PASSWORD', label: 'Nextcloud Admin Password', default: 'changeme', type: 'password' },
+      ],
+      images: [
+        "postgres:15-alpine",
+        "redis:alpine",
+        "nextcloud:fpm-alpine"
       ],
       volumes: [
-        { host: '/mnt/storage/nextcloud/config', container: '/config', label: 'Configuration Data' },
-        { host: '/mnt/storage/nextcloud/data', container: '/data', label: 'User Files Data' }
-      ],
-      recommendDb: true
+        "storage:8G:/var/lib/postgresql/data",
+        "storage:1G:/data",
+        "storage:10G:/var/www/html"
+      ]
     },
     {
-      name: 'plex',
+      name: 'wordpress-stack',
+      title: 'WordPress (with MariaDB)',
+      category: 'CMS',
+      description: 'The world\'s most popular website builder, powered by MariaDB. Natively merged without Docker!',
+      logo: 'https://upload.wikimedia.org/wikipedia/commons/9/93/Wordpress_Blue_logo.png',
+      defaultMemory: '1024',
+      variables: [
+        { key: 'DB_PASSWORD', label: 'Database Password', default: 'securepassword', type: 'password' },
+      ],
+      images: [
+        "mariadb:10.6",
+        "wordpress:fpm-alpine"
+      ],
+      volumes: [
+        "storage:5G:/var/lib/mysql",
+        "storage:5G:/var/www/html"
+      ]
+    },
+    {
+      name: 'plex-stack',
       title: 'Plex Media Server',
       category: 'Media',
       description: 'Organizes video, music and photos from personal media libraries and streams them to smart TVs.',
       logo: 'https://upload.wikimedia.org/wikipedia/commons/7/7b/Plex_logo_2022.svg',
-      image: 'lscr.io/linuxserver/plex:latest',
       defaultMemory: '2048',
-      wizard: [
-        { key: 'PUID', label: 'User ID (PUID)', value: '1000' },
-        { key: 'PGID', label: 'Group ID (PGID)', value: '1000' },
-        { key: 'TZ', label: 'Timezone', value: 'Europe/London' },
-        { key: 'VERSION', label: 'Plex Pass Version', value: 'docker' }
+      variables: [
+        { key: 'CLAIM_TOKEN', label: 'Plex Claim Token', default: '', type: 'text', help: 'Get one at plex.tv/claim' },
+        { key: 'TZ', label: 'Timezone', default: 'Europe/London', type: 'text' },
+      ],
+      images: [
+        "lscr.io/linuxserver/plex:latest"
       ],
       volumes: [
-        { host: '/mnt/storage/plex/config', container: '/config', label: 'Plex Database' },
-        { host: '/mnt/storage/media/movies', container: '/movies', label: 'Movies Directory' },
-        { host: '/mnt/storage/media/tv', container: '/tv', label: 'TV Shows Directory' }
-      ],
-      recommendDb: false
-    },
-    {
-      name: 'pihole',
-      title: 'Pi-hole',
-      category: 'Network',
-      description: 'A black hole for Internet advertisements. Network-wide ad blocking.',
-      logo: 'https://upload.wikimedia.org/wikipedia/commons/0/0c/Pi-hole_Logo.png',
-      image: 'pihole/pihole:latest',
-      defaultMemory: '512',
-      wizard: [
-        { key: 'TZ', label: 'Timezone', value: 'Europe/London' },
-        { key: 'WEBPASSWORD', label: 'Web Admin Password', value: 'admin' }
-      ],
-      volumes: [
-        { host: '/mnt/storage/pihole/etc', container: '/etc/pihole', label: 'Pi-hole Config' },
-        { host: '/mnt/storage/pihole/dnsmasq', container: '/etc/dnsmasq.d', label: 'DNSMasq Config' }
-      ],
-      recommendDb: false
-    },
-    {
-      name: 'nginx-proxy-manager',
-      title: 'Nginx Proxy Manager',
-      category: 'Network',
-      description: 'Docker container for managing Nginx proxy hosts with a simple, powerful interface.',
-      logo: 'https://raw.githubusercontent.com/NginxProxyManager/nginx-proxy-manager/master/frontend/images/logo.png',
-      image: 'jc21/nginx-proxy-manager:latest',
-      defaultMemory: '1024',
-      wizard: [],
-      volumes: [
-        { host: '/mnt/storage/npm/data', container: '/data', label: 'Proxy Configs' },
-        { host: '/mnt/storage/npm/letsencrypt', container: '/etc/letsencrypt', label: 'SSL Certificates' }
-      ],
-      recommendDb: true
+        "storage:10G:/config",
+        "storage:50G:/media"
+      ]
     }
   ];
 
-  let images: any[] = [];
-  let loading = true;
-  let errorMsg = '';
-  
-  let currentTab: 'featured' | 'linuxserver' = 'featured';
-
   let showModal = false;
-  let selectedApp: any = null;
-  let isFeaturedApp = false;
-  
+  let selectedApp: CatalogItem | null = null;
   let targetVmid = '';
-  let targetNode = 'pve';
-  
   let isDeploying = false;
   let deployStatus = '';
-  let deployProgress = 0;
-
-  let memory = '512';
-  let envVars: {key: string, value: string}[] = [];
-  let volumes: any[] = [];
-  let useHostableDb = false;
-  let dbName = '';
+  
+  let userVariables: Record<string, string> = {};
+  
+  // Storage settings
+  let memory = '1024';
   let templateStorage = 'local';
   let rootfsStorage = 'local-lvm';
   let availableStorages: any[] = [];
+  let loading = true;
 
   onMount(async () => {
     try {
@@ -111,49 +100,26 @@
       if (storageRes && storageRes.data) {
         availableStorages = storageRes.data.filter((s: any) => s.content && s.content.includes('rootdir'));
       }
-      
-      const json = await apiGet('/catalog');
-      
-      if (json.data && json.data.repositories && json.data.repositories.linuxserver) {
-        images = json.data.repositories.linuxserver.filter((img: any) => !img.deprecated);
-      } else {
-        errorMsg = 'Invalid catalog format';
-      }
     } catch (e: any) {
-      errorMsg = e.message;
+      toasts.add(`Failed to load storages: ${e.message}`, 'error');
     } finally {
       loading = false;
     }
   });
 
-  function openDeployModal(app: any, featured: boolean = false) {
+  function openDeployModal(app: CatalogItem) {
     selectedApp = app;
-    isFeaturedApp = featured;
     showModal = true;
-    targetVmid = Math.floor(Math.random() * (900 - 200 + 1) + 200).toString(); // Random VMID
+    targetVmid = Math.floor(Math.random() * (900 - 200 + 1) + 200).toString();
     deployStatus = '';
     isDeploying = false;
-    deployProgress = 0;
+    memory = app.defaultMemory;
     
-    if (featured) {
-      memory = app.defaultMemory || '512';
-      envVars = app.wizard ? JSON.parse(JSON.stringify(app.wizard)) : [];
-      let defaultStorage = availableStorages.length > 0 ? availableStorages[0].storage : 'local-lvm';
-      volumes = app.volumes ? JSON.parse(JSON.stringify(app.volumes)).map((v: any) => ({
-        ...v,
-        type: 'managed',
-        storage: defaultStorage,
-        size: 8
-      })) : [];
-      useHostableDb = app.recommendDb || false;
-    } else {
-      memory = '512';
-      envVars = [];
-      volumes = [];
-      useHostableDb = false;
-    }
-    
-    dbName = (app.name || app.title).replace(/[^a-zA-Z0-9]/g, '');
+    userVariables = {};
+    app.variables.forEach(v => {
+      userVariables[v.key] = v.default;
+    });
+
     templateStorage = localStorage.getItem('hostable_tpl_storage') || 'local';
     rootfsStorage = localStorage.getItem('hostable_rootfs_storage') || 'local-lvm';
   }
@@ -165,45 +131,35 @@
     }
   }
 
-  async function deployApp() {
-    if (!targetVmid) return;
+  async function deployStack() {
+    if (!selectedApp || !targetVmid) return;
     
     isDeploying = true;
-    deployStatus = 'Preparing Deployment...';
-    deployProgress = 20;
+    deployStatus = 'Preparing Stack Deployment...';
 
     try {
-      let imageString = isFeaturedApp ? selectedApp.image : `lscr.io/linuxserver/${selectedApp.name}:latest`;
-      let hostname = isFeaturedApp ? selectedApp.name : selectedApp.name;
+      // Interpolate rootfsStorage into volume definitions
+      const actualVolumes = selectedApp.volumes 
+        ? selectedApp.volumes.map(v => v.replace('storage', rootfsStorage))
+        : [];
 
       const payload = {
-        image: imageString,
-        hostname: hostname,
+        images: selectedApp.images,
+        hostname: selectedApp.name,
         vmid: parseInt(targetVmid),
         memory,
         template_storage: templateStorage,
         rootfs_storage: rootfsStorage,
-        env_vars: envVars.filter(e => e.key).map(e => `${e.key}=${e.value}`),
-        volumes: volumes.map(v => {
-          if (v.type === 'managed' && v.storage) {
-            return `storage:${v.storage}:${v.size || 8}:${v.container}`;
-          } else if (v.host) {
-            return `bind:${v.host}:${v.container}`;
-          }
-          return '';
-        }).filter(v => v !== ''),
-        use_hostable_db: useHostableDb,
-        db_name: useHostableDb ? dbName : null,
+        env_vars: userVariables,
+        volumes: actualVolumes
       };
 
-      deployStatus = 'Deploying LXC Container (this may take a minute)...';
-      deployProgress = 60;
+      deployStatus = 'Deploying App Stack via LXC (this may take a few minutes)...';
 
-      const responseData = await apiPost('/deploy', payload);
+      const res = await apiPost('/lxc/stack/deploy', payload);
       
-      deployStatus = 'Success! Container deployed and starting.';
-      toasts.add(`Successfully deployed ${hostname}!`, 'success');
-      deployProgress = 100;
+      deployStatus = 'Success! Stack is running in the LXC.';
+      toasts.add(`Successfully deployed ${selectedApp.name}!`, 'success');
       
       setTimeout(() => {
         closeDeployModal();
@@ -211,18 +167,10 @@
       
     } catch (err: any) {
       deployStatus = `Error: ${err.message}`;
-      toasts.add(`Deployment failed: ${err.message}`, 'error', 5000);
+      toasts.add(`Deployment failed: ${err.message}`, 'error', 10000);
       isDeploying = false;
     }
   }
-
-  function addEnv() { envVars = [...envVars, {key: '', value: ''}]; }
-  function removeEnv(idx: number) { envVars = envVars.filter((_, i) => i !== idx); }
-  function addVol() { 
-    let defaultStorage = availableStorages.length > 0 ? availableStorages[0].storage : 'local-lvm';
-    volumes = [...volumes, {type: 'managed', storage: defaultStorage, size: 8, host: '', container: ''}]; 
-  }
-  function removeVol(idx: number) { volumes = volumes.filter((_, i) => i !== idx); }
 </script>
 
 <style>
@@ -232,493 +180,241 @@
     padding-right: 1rem;
   }
 
-  .tabs {
-    display: flex;
-    gap: 1rem;
-    margin-bottom: 2rem;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 0.5rem;
-  }
-
-  .tab {
-    background: transparent;
-    border: none;
-    color: #94a3b8;
-    font-size: 1.1rem;
-    font-weight: 500;
-    cursor: pointer;
-    padding: 0.5rem 1rem;
-    border-radius: 6px;
-    transition: all 0.2s;
-  }
-
-  .tab.active {
-    color: #38bdf8;
-    background: rgba(56, 189, 248, 0.1);
-  }
-
-  .tab:hover:not(.active) {
-    color: #cbd5e1;
-    background: rgba(255, 255, 255, 0.05);
-  }
-
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
     gap: 1.5rem;
+    margin-top: 1.5rem;
   }
 
-  .card {
-    background: #1e293b;
-    border: 1px solid #334155;
+  .app-card {
+    background: var(--surface-color, #1e293b);
+    border: 1px solid var(--surface-border, #334155);
     border-radius: 12px;
     padding: 1.5rem;
     display: flex;
     flex-direction: column;
     gap: 1rem;
-    transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    transition: transform 0.2s, box-shadow 0.2s;
   }
 
-  .card:hover {
+  .app-card:hover {
     transform: translateY(-4px);
-    border-color: #475569;
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    border-color: #38bdf8;
   }
 
-  .card-header {
+  .app-header {
     display: flex;
     align-items: center;
     gap: 1rem;
   }
 
-  .card-logo {
-    width: 54px;
-    height: 54px;
-    border-radius: 12px;
-    background: #0f172a;
+  .app-logo {
+    width: 60px;
+    height: 60px;
     object-fit: contain;
-    padding: 6px;
-    border: 1px solid #334155;
-  }
-
-  .card-title {
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: #f8fafc;
-    margin: 0;
-  }
-
-  .card-category {
-    font-size: 0.8rem;
-    color: #94a3b8;
-    background: #0f172a;
-    padding: 2px 8px;
+    background: white;
     border-radius: 12px;
-    border: 1px solid #334155;
-    display: inline-block;
-    margin-top: 4px;
+    padding: 0.5rem;
   }
 
-  .card-desc {
-    color: #cbd5e1;
-    font-size: 0.9rem;
+  .app-info h3 {
+    margin: 0 0 0.2rem 0;
+    font-size: 1.2rem;
+    color: #f8fafc;
+  }
+
+  .app-info .category {
+    font-size: 0.85rem;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.1);
+    padding: 0.2rem 0.6rem;
+    border-radius: 20px;
+    display: inline-block;
+  }
+
+  .app-desc {
+    color: #94a3b8;
+    font-size: 0.95rem;
     line-height: 1.5;
     flex-grow: 1;
-    display: -webkit-box;
-    -webkit-line-clamp: 3;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
   }
 
-  .deploy-btn {
-    width: 100%;
-    background: #38bdf8;
-    color: #0f172a;
-    border: none;
-    border-radius: 8px;
-    padding: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .deploy-btn:hover {
-    background: #0ea5e9;
-  }
-
-  /* Modal Styles */
+  /* Modal */
   .modal-backdrop {
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(15, 23, 42, 0.8);
+    background: rgba(15, 23, 42, 0.85);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(8px);
+    z-index: 2000;
   }
 
-  .modal {
-    background: #1e293b;
-    border: 1px solid #334155;
+  .modal-content {
+    background: var(--surface-color, #1e293b);
+    border: 1px solid var(--surface-border, #334155);
     border-radius: 12px;
-    padding: 2rem;
-    width: 500px;
-    max-width: 90%;
+    width: 90%;
+    max-width: 600px;
     max-height: 90vh;
-    overflow-y: auto;
-    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-  }
-
-  .modal h2 {
-    margin-top: 0;
-    color: #f8fafc;
-    font-size: 1.5rem;
-    margin-bottom: 1.5rem;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 1rem;
     display: flex;
-    align-items: center;
-    gap: 1rem;
+    flex-direction: column;
+    overflow: hidden;
   }
 
-  .modal h2 img {
-    width: 32px;
-    height: 32px;
-    border-radius: 6px;
+  .modal-header {
+    padding: 1.5rem;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  
+  .modal-body {
+    padding: 1.5rem;
+    overflow-y: auto;
+    flex-grow: 1;
+  }
+  
+  .modal-footer {
+    padding: 1.5rem;
+    border-top: 1px solid #334155;
+    display: flex;
+    justify-content: flex-end;
+    gap: 1rem;
   }
 
   .form-group {
     margin-bottom: 1.2rem;
   }
-
   .form-group label {
     display: block;
-    color: #94a3b8;
-    font-size: 0.9rem;
-    margin-bottom: 0.4rem;
+    color: #cbd5e1;
+    margin-bottom: 0.5rem;
     font-weight: 500;
   }
+  .form-group .help-text {
+    font-size: 0.8rem;
+    color: #64748b;
+    margin-top: 0.2rem;
+  }
 
-  .form-group input {
+  .input-field {
     width: 100%;
     background: #0f172a;
     border: 1px solid #334155;
     color: #f8fafc;
-    border-radius: 8px;
-    padding: 0.8rem;
-    font-size: 0.95rem;
-    box-sizing: border-box;
-    transition: border-color 0.2s;
-  }
-
-  .form-group input:focus {
-    outline: none;
-    border-color: #38bdf8;
-  }
-
-  .modal-actions {
-    display: flex;
-    gap: 1rem;
-    margin-top: 2rem;
-  }
-
-  .btn-cancel {
-    flex: 1;
-    background: transparent;
-    border: 1px solid #475569;
-    color: #cbd5e1;
-    border-radius: 8px;
-    padding: 0.8rem;
-    cursor: pointer;
-    font-weight: 500;
-  }
-
-  .btn-cancel:hover {
-    background: #334155;
-  }
-
-  .btn-confirm {
-    flex: 1;
-    background: #38bdf8;
-    color: #0f172a;
-    border: none;
-    border-radius: 8px;
-    padding: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .btn-confirm:hover:not(:disabled) {
-    background: #0ea5e9;
-  }
-
-  .btn-confirm:disabled {
-    background: #475569;
-    color: #94a3b8;
-    cursor: not-allowed;
-  }
-  
-  .progress-bar {
-    width: 100%;
-    height: 8px;
-    background: #0f172a;
-    border-radius: 4px;
-    margin-top: 1rem;
-    overflow: hidden;
-  }
-  
-  .progress-fill {
-    height: 100%;
-    background: #38bdf8;
-    transition: width 0.3s ease;
-  }
-
-  .wizard-section {
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1rem;
-    margin-bottom: 1.2rem;
-  }
-
-  .wizard-section h3 {
-    margin: 0 0 1rem 0;
-    color: #e2e8f0;
+    padding: 0.75rem;
+    border-radius: 6px;
     font-size: 1rem;
-    font-weight: 500;
   }
 </style>
 
 <div class="catalog-container animate-fade-in">
-  <div style="margin-bottom: 1rem;">
-    <h1 style="font-size: 2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">App Catalog</h1>
-    <p style="color: #94a3b8; font-size: 1rem;">1-Click deploy templates seamlessly to your Proxmox node.</p>
+  <div style="margin-bottom: 2rem;">
+    <h1 style="font-size: 2.2rem; font-weight: 600; color: #f8fafc; margin-bottom: 0.5rem;">App Store 2.0 (Stacks)</h1>
+    <p style="color: #94a3b8; font-size: 1.05rem;">Deploy fully self-contained Docker Compose stacks inside optimized LXC containers.</p>
   </div>
 
-  <div class="tabs">
-    <button class="tab {currentTab === 'featured' ? 'active' : ''}" on:click={() => currentTab = 'featured'}>
-      ⭐ Featured Apps
-    </button>
-    <button class="tab {currentTab === 'linuxserver' ? 'active' : ''}" on:click={() => currentTab = 'linuxserver'}>
-      🐧 LinuxServer.io
-    </button>
+  <div class="grid">
+    {#each catalogItems as app}
+      <div class="app-card">
+        <div class="app-header">
+          <img src={app.logo} alt={app.title} class="app-logo" />
+          <div class="app-info">
+            <h3>{app.title}</h3>
+            <span class="category">{app.category}</span>
+          </div>
+        </div>
+        <p class="app-desc">{app.description}</p>
+        <button class="flat-btn-primary" style="width: 100%; background: #0ea5e9; color: white;" on:click={() => openDeployModal(app)}>
+          🚀 Deploy Stack
+        </button>
+      </div>
+    {/each}
   </div>
 
-  {#if errorMsg}
-    <div style="padding: 1rem; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid #ef4444; border-radius: 8px; margin-bottom: 1rem;">
-      {errorMsg}
-    </div>
-  {/if}
-
-  {#if currentTab === 'featured'}
-    <div class="grid animate-fade-in">
-      {#each featuredApps as app}
-        <div class="card">
-          <div class="card-header">
-            <img src={app.logo} alt={app.title} class="card-logo"/>
-            <div>
-              <h3 class="card-title">{app.title}</h3>
-              <span class="card-category">{app.category}</span>
-            </div>
+  {#if showModal && selectedApp}
+    <div class="modal-backdrop" on:click={closeDeployModal} on:keydown={(e) => e.key === 'Escape' && closeDeployModal()} tabindex="0" role="button">
+      <div class="modal-content" on:click|stopPropagation on:keydown|stopPropagation tabindex="0" role="dialog">
+        <div class="modal-header">
+          <div style="display: flex; align-items: center; gap: 1rem;">
+            <img src={selectedApp.logo} alt={selectedApp.title} style="width: 40px; height: 40px; background: white; border-radius: 8px; padding: 4px;" />
+            <h2 style="margin: 0; color: white; font-size: 1.3rem;">Deploy {selectedApp.title} Stack</h2>
           </div>
-          <div class="card-desc" title={app.description}>
-            {app.description}
-          </div>
-          <div style="margin-top: auto;">
-            <button class="deploy-btn" on:click={() => openDeployModal(app, true)}>1-Click Deploy</button>
-          </div>
+          <button class="flat-btn-outline" style="padding: 0.2rem 0.6rem; border: none;" on:click={closeDeployModal}>✕</button>
         </div>
-      {/each}
-    </div>
-  {:else}
-    {#if loading}
-      <div style="color: #94a3b8; text-align: center; padding: 3rem;">
-        Loading Catalog from LinuxServer API...
-      </div>
-    {:else}
-      <div class="grid animate-fade-in">
-        {#each images as app}
-          <div class="card">
-            <div class="card-header">
-              <img src={app.project_logo || 'https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/linuxserver-ls-logo.png'} alt={app.name} class="card-logo" on:error={(e) => e.currentTarget.src='https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/linuxserver-ls-logo.png'}/>
-              <div>
-                <h3 class="card-title">{app.name}</h3>
-                {#if app.category}
-                  <span class="card-category">{app.category.split(',')[0]}</span>
-                {/if}
-              </div>
+
+        <div class="modal-body">
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem;">
+            <div class="form-group">
+              <label for="vmid">LXC VMID</label>
+              <input type="number" id="vmid" class="input-field" bind:value={targetVmid} disabled={isDeploying} />
             </div>
-            <div class="card-desc" title={app.description}>
-              {app.description}
-            </div>
-            <div style="margin-top: auto;">
-              <button class="deploy-btn" on:click={() => openDeployModal(app, false)}>Deploy Instance</button>
+            <div class="form-group">
+              <label for="memory">Memory (MB)</label>
+              <input type="number" id="memory" class="input-field" bind:value={memory} disabled={isDeploying} />
             </div>
           </div>
-        {/each}
-      </div>
-    {/if}
-  {/if}
-</div>
 
-{#if showModal}
-  <div class="modal-backdrop" on:click|self={closeDeployModal}>
-    <div class="modal animate-fade-in">
-      <h2>
-        {#if isFeaturedApp}
-          <img src={selectedApp.logo} alt="logo" />
-        {/if}
-        Deploy {isFeaturedApp ? selectedApp.title : selectedApp?.name}
-      </h2>
-      
-      <div style="display: flex; gap: 1rem;">
-        <div class="form-group" style="flex: 1;">
-          <label for="vmid">Target Container ID (VMID)</label>
-          <input id="vmid" type="number" bind:value={targetVmid} disabled={isDeploying} />
-        </div>
-        <div class="form-group" style="flex: 1;">
-          <label for="memory">Memory (MB)</label>
-          <input id="memory" type="number" bind:value={memory} disabled={isDeploying} />
-        </div>
-      </div>
-
-      {#if isFeaturedApp}
-        <!-- SMART WIZARD MODE -->
-        {#if envVars.length > 0}
-          <div class="wizard-section">
-            <h3>Configuration</h3>
-            {#each envVars as env, i}
-              <div class="form-group" style="margin-bottom: 0.8rem;">
-                <label>{env.label || env.key}</label>
-                <input type="text" bind:value={env.value} disabled={isDeploying} />
-              </div>
-            {/each}
-          </div>
-        {/if}
-
-        {#if volumes.length > 0}
-          <div class="wizard-section">
-            <h3>Storage Mounts</h3>
-            {#each volumes as vol, i}
-              <div class="form-group" style="margin-bottom: 1.2rem; padding-bottom: 1rem; border-bottom: 1px solid #334155;">
-                <label style="display: flex; justify-content: space-between; align-items: center;">
-                  <span>{vol.label || 'Volume ' + (i+1)} ({vol.container})</span>
-                  <select bind:value={vol.type} style="background: #1e293b; color: #e2e8f0; border: 1px solid #475569; padding: 0.3rem; border-radius: 4px;" disabled={isDeploying}>
-                    <option value="managed">Managed Storage Volume</option>
-                    <option value="bind">Host Bind Mount</option>
-                  </select>
-                </label>
-                
-                {#if vol.type === 'managed'}
-                  <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
-                    <div style="flex: 2;">
-                      <select bind:value={vol.storage} style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" disabled={isDeploying}>
-                        {#each availableStorages as s}
-                          <option value={s.storage}>{s.storage} ({s.type})</option>
-                        {/each}
-                      </select>
-                    </div>
-                    <div style="flex: 1; display: flex; align-items: center; gap: 0.5rem; background: #1e293b; border: 1px solid #475569; border-radius: 6px; padding: 0 0.5rem;">
-                      <input type="number" bind:value={vol.size} style="width: 100%; border: none; background: transparent; color: #fff; outline: none;" disabled={isDeploying} min="1"/>
-                      <span style="color: #94a3b8; font-size: 0.9rem;">GB</span>
-                    </div>
-                  </div>
-                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.3rem;">Proxmox will automatically provision a {vol.size || 8}GB virtual disk for this volume.</div>
-                {:else}
-                  <input type="text" bind:value={vol.host} disabled={isDeploying} placeholder="/host/path" style="margin-top: 0.5rem; width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box;" />
-                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.3rem;">Enter an absolute path on the Proxmox host.</div>
+          <div style="background: rgba(15, 23, 42, 0.5); padding: 1.5rem; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 1.5rem;">
+            <h3 style="margin-top: 0; color: #e2e8f0; font-size: 1.1rem; margin-bottom: 1rem;">App Configuration</h3>
+            
+            {#each selectedApp.variables as variable}
+              <div class="form-group">
+                <label for={variable.key}>{variable.label}</label>
+                <input 
+                  type={variable.type} 
+                  id={variable.key} 
+                  class="input-field" 
+                  bind:value={userVariables[variable.key]} 
+                  disabled={isDeploying} 
+                />
+                {#if variable.help}
+                  <div class="help-text">{variable.help}</div>
                 {/if}
               </div>
             {/each}
           </div>
-        {/if}
-      {:else}
-        <!-- EXPERT MODE (RAW ENV / VOLUMES) -->
-        <div class="wizard-section">
-          <label style="display: flex; justify-content: space-between; color: #e2e8f0; font-size: 1rem; margin-bottom: 1rem; font-weight: 500;">
-            Environment Variables
-            <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.85rem;" on:click={addEnv} disabled={isDeploying}>+ Add</button>
-          </label>
-          {#each envVars as env, i}
-            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.8rem;">
-              <input type="text" placeholder="KEY" style="flex: 1; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" bind:value={env.key} disabled={isDeploying} />
-              <input type="text" placeholder="VALUE" style="flex: 1; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" bind:value={env.value} disabled={isDeploying} />
-              <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeEnv(i)} disabled={isDeploying}>✖</button>
-            </div>
-          {/each}
-        </div>
 
-        <div class="wizard-section">
-          <label style="display: flex; justify-content: space-between; color: #e2e8f0; font-size: 1rem; margin-bottom: 1rem; font-weight: 500;">
-            Volume Mappings
-            <button style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 0.85rem;" on:click={addVol} disabled={isDeploying}>+ Add</button>
-          </label>
-          {#each volumes as vol, i}
-            <div style="background: rgba(0,0,0,0.2); padding: 0.8rem; border-radius: 6px; margin-bottom: 0.8rem; border: 1px solid #334155;">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                <select bind:value={vol.type} style="background: #1e293b; color: #e2e8f0; border: 1px solid #475569; padding: 0.3rem; border-radius: 4px;" disabled={isDeploying}>
-                  <option value="managed">Managed Storage Volume</option>
-                  <option value="bind">Host Bind Mount</option>
+          <details style="background: rgba(15, 23, 42, 0.3); padding: 1rem; border-radius: 8px; border: 1px solid #1e293b;">
+            <summary style="cursor: pointer; color: #cbd5e1; font-weight: 500;">Advanced Storage Settings</summary>
+            <div style="margin-top: 1rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+              <div class="form-group">
+                <label for="tpl">Template Storage</label>
+                <select id="tpl" class="input-field" bind:value={templateStorage} disabled={isDeploying}>
+                  {#each availableStorages as s}
+                    <option value={s.storage}>{s.storage}</option>
+                  {/each}
                 </select>
-                <button style="background: transparent; color: #ef4444; border: none; cursor: pointer; font-size: 1.2rem;" on:click={() => removeVol(i)} disabled={isDeploying}>✖</button>
               </div>
-              
-              <input type="text" placeholder="Container Mount Path (e.g. /config)" style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box; margin-bottom: 0.5rem;" bind:value={vol.container} disabled={isDeploying} />
-
-              {#if vol.type === 'managed'}
-                <div style="display: flex; gap: 0.5rem;">
-                  <div style="flex: 2;">
-                    <select bind:value={vol.storage} style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px;" disabled={isDeploying}>
-                      {#each availableStorages as s}
-                        <option value={s.storage}>{s.storage} ({s.type})</option>
-                      {/each}
-                    </select>
-                  </div>
-                  <div style="flex: 1; display: flex; align-items: center; gap: 0.5rem; background: #1e293b; border: 1px solid #475569; border-radius: 6px; padding: 0 0.5rem;">
-                    <input type="number" bind:value={vol.size} style="width: 100%; border: none; background: transparent; color: #fff; outline: none;" disabled={isDeploying} min="1"/>
-                    <span style="color: #94a3b8; font-size: 0.9rem;">GB</span>
-                  </div>
-                </div>
-              {:else}
-                <input type="text" placeholder="Host Path (e.g. /mnt/data)" style="width: 100%; padding: 0.6rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box;" bind:value={vol.host} disabled={isDeploying} />
-              {/if}
+              <div class="form-group">
+                <label for="rtfs">Rootfs Storage</label>
+                <select id="rtfs" class="input-field" bind:value={rootfsStorage} disabled={isDeploying}>
+                  {#each availableStorages as s}
+                    <option value={s.storage}>{s.storage}</option>
+                  {/each}
+                </select>
+              </div>
             </div>
-          {/each}
-        </div>
-      {/if}
+          </details>
 
-      <div class="wizard-section" style="border-color: #38bdf8; background: rgba(56, 189, 248, 0.05);">
-        <label style="display: flex; align-items: center; gap: 0.8rem; color: #e2e8f0; font-size: 0.95rem; cursor: pointer; font-weight: 500;">
-          <input type="checkbox" bind:checked={useHostableDb} disabled={isDeploying} style="width: 1.2rem; height: 1.2rem; cursor: pointer;" />
-          Provision Managed PostgreSQL Database
-        </label>
-        {#if useHostableDb}
-          <div style="margin-top: 1rem;">
-            <label style="color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.4rem; display: block;">Database Name (Alphanumeric only)</label>
-            <input type="text" placeholder="e.g. nextclouddb" style="width: 100%; padding: 0.8rem; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 8px; box-sizing: border-box;" bind:value={dbName} disabled={isDeploying} />
-          </div>
-        {/if}
-      </div>
-      
-      {#if deployStatus}
-        <div style="margin-top: 1.5rem; color: #cbd5e1; font-size: 0.95rem; text-align: center; font-weight: 500;">
-          {deployStatus}
-          {#if isDeploying || deployProgress === 100}
-            <div class="progress-bar">
-              <div class="progress-fill" style="width: {deployProgress}%"></div>
+          {#if deployStatus}
+            <div style="margin-top: 1.5rem; padding: 1rem; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; color: #38bdf8;">
+              {deployStatus}
             </div>
           {/if}
         </div>
-      {/if}
 
-      <div class="modal-actions">
-        <button class="btn-cancel" on:click={closeDeployModal} disabled={isDeploying}>Cancel</button>
-        <button class="btn-confirm" on:click={deployApp} disabled={isDeploying || !targetVmid}>
-          {isDeploying ? 'Deploying...' : 'Deploy Instance Now'}
-        </button>
+        <div class="modal-footer">
+          <button class="flat-btn-outline" on:click={closeDeployModal} disabled={isDeploying}>Cancel</button>
+          <button class="flat-btn-primary" style="background: #10b981; color: white;" on:click={deployStack} disabled={isDeploying || !targetVmid}>
+            {isDeploying ? 'Deploying...' : '🚀 Launch Stack'}
+          </button>
+        </div>
       </div>
     </div>
-  </div>
-{/if}
+  {/if}
+</div>

@@ -1,5 +1,4 @@
-
-use axum::{Json, response::IntoResponse, http::StatusCode};
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -46,7 +45,7 @@ pub async fn deploy_lxc_endpoint(
     Json(payload): Json<DeployRequest>,
 ) -> impl IntoResponse {
     let node = state.default_node.clone();
-    
+
     // 1. Process DB Provisioning
     let mut final_envs = payload.env_vars.clone();
     if payload.use_hostable_db {
@@ -58,10 +57,14 @@ pub async fn deploy_lxc_endpoint(
                 if let Err(e) = sqlx::query(&q).execute(pool).await {
                     println!("Failed to create DB (might exist): {}", e);
                 }
-                
+
                 if let Ok(ip) = local_ip_address::local_ip() {
                     // For now, assuming hostable connects as admin user, we will just pass the admin credentials or a dedicated user
-                    let db_url = format!("postgres://postgres:postgres@{}:5432/{}", ip.to_string(), safe_db);
+                    let db_url = format!(
+                        "postgres://postgres:postgres@{}:5432/{}",
+                        ip.to_string(),
+                        safe_db
+                    );
                     final_envs.push(format!("DATABASE_URL={}", db_url));
                 }
             }
@@ -76,21 +79,37 @@ pub async fn deploy_lxc_endpoint(
     }
     let out_path = cache_dir.join(format!("hostable_vmid_{}.tar.xz", payload.vmid));
     let filename = format!("hostable_vmid_{}.tar.xz", payload.vmid);
-    
-    match extractor.extract_to_dir(&payload.image, &out_path, Some(&final_envs)).await {
+
+    match extractor
+        .extract_to_dir(&payload.image, &out_path, Some(&final_envs), None)
+        .await
+    {
         Ok(_) => {
             // 3. Upload to Proxmox
-            match state.proxmox.upload_template(&node, &payload.template_storage, &out_path, &filename).await {
+            match state
+                .proxmox
+                .upload_template(&node, &payload.template_storage, &out_path, &filename)
+                .await
+            {
                 Ok(_) => {
                     // 4. Create LXC
                     let mut params = std::collections::HashMap::new();
                     params.insert("vmid".to_string(), payload.vmid.to_string());
-                    params.insert("ostemplate".to_string(), format!("{}:vztmpl/{}", payload.template_storage, filename));
+                    params.insert(
+                        "ostemplate".to_string(),
+                        format!("{}:vztmpl/{}", payload.template_storage, filename),
+                    );
                     params.insert("hostname".to_string(), payload.hostname.clone());
                     params.insert("memory".to_string(), payload.memory.clone());
-                    params.insert("net0".to_string(), "name=eth0,bridge=vmbr0,ip=dhcp".to_string());
+                    params.insert(
+                        "net0".to_string(),
+                        "name=eth0,bridge=vmbr0,ip=dhcp".to_string(),
+                    );
                     params.insert("storage".to_string(), payload.rootfs_storage.clone());
-                    params.insert("rootfs".to_string(), format!("{}:8", payload.rootfs_storage));
+                    params.insert(
+                        "rootfs".to_string(),
+                        format!("{}:8", payload.rootfs_storage),
+                    );
                     params.insert("tags".to_string(), "hostable".to_string());
                     params.insert("unprivileged".to_string(), "1".to_string());
                     params.insert("features".to_string(), "nesting=1".to_string());
@@ -103,17 +122,26 @@ pub async fn deploy_lxc_endpoint(
                             let storage_name = parts[1];
                             let size_gb = parts[2];
                             let container_path = parts[3];
-                            params.insert(format!("mp{}", i), format!("{}:{},mp={}", storage_name, size_gb, container_path));
+                            params.insert(
+                                format!("mp{}", i),
+                                format!("{}:{},mp={}", storage_name, size_gb, container_path),
+                            );
                         } else if parts.len() == 3 && parts[0] == "bind" {
                             // format: bind:host_path:container_path
                             let host_path = parts[1];
                             let container_path = parts[2];
-                            params.insert(format!("mp{}", i), format!("{},mp={}", host_path, container_path));
+                            params.insert(
+                                format!("mp{}", i),
+                                format!("{},mp={}", host_path, container_path),
+                            );
                         } else if parts.len() == 2 {
                             // format: host_path:container_path (fallback/legacy)
                             let host_path = parts[0];
                             let container_path = parts[1];
-                            params.insert(format!("mp{}", i), format!("{},mp={}", host_path, container_path));
+                            params.insert(
+                                format!("mp{}", i),
+                                format!("{},mp={}", host_path, container_path),
+                            );
                         }
                     }
 
@@ -121,19 +149,43 @@ pub async fn deploy_lxc_endpoint(
                         Ok(_) => {
                             tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
                             let _ = state.proxmox.start_lxc(&node, payload.vmid).await;
-                            
-                            (StatusCode::OK, Json(DeployResponse {
-                                status: "ok".to_string(),
-                                message: format!("Successfully deployed {} as LXC {}", payload.hostname, payload.vmid),
-                            }))
-                        },
-                        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Create failed: {}", e) }))
+
+                            (
+                                StatusCode::OK,
+                                Json(DeployResponse {
+                                    status: "ok".to_string(),
+                                    message: format!(
+                                        "Successfully deployed {} as LXC {}",
+                                        payload.hostname, payload.vmid
+                                    ),
+                                }),
+                            )
+                        }
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(DeployResponse {
+                                status: "error".to_string(),
+                                message: format!("Create failed: {}", e),
+                            }),
+                        ),
                     }
-                },
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Upload failed: {}", e) }))
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(DeployResponse {
+                        status: "error".to_string(),
+                        message: format!("Upload failed: {}", e),
+                    }),
+                ),
             }
-        },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(DeployResponse { status: "error".to_string(), message: format!("Extraction failed: {}", e) }))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(DeployResponse {
+                status: "error".to_string(),
+                message: format!("Extraction failed: {}", e),
+            }),
+        ),
     }
 }
 
@@ -179,12 +231,12 @@ pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
                     }
                 }
             } else if image_part.starts_with("ubuntu") || image_part.contains("ubuntu") {
-                 base_image = "ubuntu".to_string();
-                 if let Some((_, r)) = image_part.split_once(':') {
-                     release = r.to_string();
-                 } else {
-                     release = "jammy".to_string(); // Placeholder
-                 }
+                base_image = "ubuntu".to_string();
+                if let Some((_, r)) = image_part.split_once(':') {
+                    release = r.to_string();
+                } else {
+                    release = "jammy".to_string(); // Placeholder
+                }
             }
         } else if let Some(rest) = line.strip_prefix("RUN ") {
             // Append to actions shell script
@@ -197,7 +249,10 @@ pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
         } else if let Some(rest) = line.strip_prefix("CMD ") {
             actions.push(format!("echo '#!/bin/sh' > /etc/local.d/hostable.start"));
             // Safe escape for complex commands
-            actions.push(format!("echo '{}' >> /etc/local.d/hostable.start", rest.replace("'", "'\\''")));
+            actions.push(format!(
+                "echo '{}' >> /etc/local.d/hostable.start",
+                rest.replace("'", "'\\''")
+            ));
             actions.push("chmod +x /etc/local.d/hostable.start".to_string());
             actions.push("rc-update add local default".to_string());
         }
@@ -208,7 +263,7 @@ pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
     yaml.push_str(&format!("  distribution: {}\n", base_image));
     yaml.push_str(&format!("  release: {}\n", release));
     yaml.push_str("  architecture: x86_64\n\n");
-    
+
     // Add default sources (simplistic example)
     yaml.push_str("source:\n");
     yaml.push_str("  downloader: alpinelinux-http\n");
@@ -231,6 +286,197 @@ pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
     yaml
 }
 
+#[derive(Deserialize)]
+pub struct DeployStackRequest {
+    pub images: Vec<String>,
+    pub hostname: String,
+    pub vmid: u32,
+    pub memory: String,
+    pub template_storage: String,
+    pub rootfs_storage: String,
+    #[serde(default)]
+    pub env_vars: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+}
+
+pub async fn deploy_stack_endpoint(
+    _auth: crate::RequireAuth,
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(payload): Json<DeployStackRequest>,
+) -> impl IntoResponse {
+    let node = state.default_node.clone();
+
+    // Always start with Alpine as the base OS to provide OpenRC /sbin/init
+    let mut image_list = vec!["alpine:3.19".to_string()];
+    image_list.extend(payload.images.clone());
+
+    let mut extra_files = std::collections::HashMap::new();
+    let extractor = crate::oci::OciExtractor::new();
+
+    // Generate OpenRC scripts for each app dynamically from their OCI Config Blob
+    for (idx, img_str) in payload.images.iter().enumerate() {
+        let app_name = format!("app-{}", idx);
+
+        let mut script_content = String::new();
+        script_content.push_str("#!/bin/sh\n");
+        script_content.push_str(&format!("echo 'Starting {}...'\n", img_str));
+
+        // Inject user provided Env Vars
+        for (k, v) in &payload.env_vars {
+            script_content.push_str(&format!("export {}=\"{}\"\n", k, v.replace("\"", "\\\"")));
+        }
+
+        // Fetch OCI Config Blob
+        if let Ok(config) = extractor.get_image_config(img_str).await {
+            // Inject Image Default Env Vars
+            for env in config.env {
+                if let Some((k, v)) = env.split_once('=') {
+                    // Do not override user vars
+                    if !payload.env_vars.contains_key(k) {
+                        script_content.push_str(&format!(
+                            "export {}=\"{}\"\n",
+                            k,
+                            v.replace("\"", "\\\"")
+                        ));
+                    }
+                }
+            }
+
+            if !config.working_dir.is_empty() {
+                script_content.push_str(&format!("cd {}\n", config.working_dir));
+            }
+
+            let mut run_cmd = String::new();
+            if let Some(entrypoint) = config.entrypoint {
+                run_cmd.push_str(&entrypoint.join(" "));
+            }
+            if let Some(cmd) = config.cmd {
+                if !run_cmd.is_empty() {
+                    run_cmd.push(' ');
+                }
+                run_cmd.push_str(&cmd.join(" "));
+            }
+
+            if run_cmd.is_empty() {
+                run_cmd = "sh".to_string(); // Fallback
+            }
+
+            // Execute in background so the script completes and OpenRC continues
+            script_content.push_str(&format!(
+                "nohup {} > /var/log/{}.log 2>&1 &\n",
+                run_cmd, app_name
+            ));
+        } else {
+            script_content.push_str("echo 'Failed to fetch OCI Config!'\n");
+        }
+
+        extra_files.insert(format!("etc/local.d/{}.start", app_name), script_content);
+    }
+
+    // Enable local service in OpenRC
+    extra_files.insert(
+        "etc/runlevels/default/local".to_string(),
+        "symlink:/etc/init.d/local".to_string(),
+    ); // Symlink hack needs to be processed!
+
+    let cache_dir = std::path::PathBuf::from("/cache");
+    if !cache_dir.exists() {
+        let _ = std::fs::create_dir_all(&cache_dir);
+    }
+    let out_path = cache_dir.join(format!("hostable_stack_{}.tar.xz", payload.vmid));
+    let filename = format!("hostable_stack_{}.tar.xz", payload.vmid);
+
+    match extractor
+        .extract_multiple_to_dir(&image_list, &out_path, Some(extra_files))
+        .await
+    {
+        Ok(_) => {
+            match state
+                .proxmox
+                .upload_template(&node, &payload.template_storage, &out_path, &filename)
+                .await
+            {
+                Ok(_) => {
+                    let mut params = std::collections::HashMap::new();
+                    params.insert("vmid".to_string(), payload.vmid.to_string());
+                    params.insert(
+                        "ostemplate".to_string(),
+                        format!("{}:vztmpl/{}", payload.template_storage, filename),
+                    );
+                    params.insert("hostname".to_string(), payload.hostname.clone());
+                    params.insert("memory".to_string(), payload.memory.clone());
+                    params.insert(
+                        "net0".to_string(),
+                        "name=eth0,bridge=vmbr0,ip=dhcp".to_string(),
+                    );
+                    params.insert("storage".to_string(), payload.rootfs_storage.clone());
+                    params.insert(
+                        "rootfs".to_string(),
+                        format!("{}:8", payload.rootfs_storage),
+                    );
+                    params.insert("tags".to_string(), "hostable,stack".to_string());
+                    params.insert("unprivileged".to_string(), "1".to_string());
+                    params.insert("features".to_string(), "nesting=1,keyctl=1".to_string());
+
+                    // Map Volumes natively to Proxmox LXC Mountpoints
+                    for (i, vol) in payload.volumes.iter().enumerate() {
+                        let parts: Vec<&str> = vol.split(':').collect();
+                        if parts.len() == 4 && parts[0] == "storage" {
+                            let storage_id = parts[1];
+                            let size = parts[2];
+                            let container_path = parts[3];
+                            params.insert(
+                                format!("mp{}", i),
+                                format!("{}:{},mp={}", storage_id, size, container_path),
+                            );
+                        }
+                    }
+
+                    match state.proxmox.create_lxc(&node, payload.vmid, params).await {
+                        Ok(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                            let _ = state.proxmox.start_lxc(&node, payload.vmid).await;
+
+                            (
+                                StatusCode::OK,
+                                Json(DeployResponse {
+                                    status: "ok".to_string(),
+                                    message: format!(
+                                        "Successfully deployed Stack {} as LXC {}",
+                                        payload.hostname, payload.vmid
+                                    ),
+                                }),
+                            )
+                        }
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(DeployResponse {
+                                status: "error".to_string(),
+                                message: format!("Create failed: {}", e),
+                            }),
+                        ),
+                    }
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(DeployResponse {
+                        status: "error".to_string(),
+                        message: format!("Upload failed: {}", e),
+                    }),
+                ),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(DeployResponse {
+                status: "error".to_string(),
+                message: format!("Extraction failed: {}", e),
+            }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +485,7 @@ mod tests {
     fn test_convert_alpine_nginx() {
         let dockerfile = "FROM alpine:3.19\nRUN apk add nginx\nENV PORT=80\nCMD [\"nginx\", \"-g\", \"daemon off;\"]";
         let yaml = convert_dockerfile_to_distrobuilder(dockerfile);
-        
+
         assert!(yaml.contains("distribution: alpinelinux"));
         assert!(yaml.contains("release: 3.19"));
         assert!(yaml.contains("export PORT=80"));
@@ -251,7 +497,7 @@ mod tests {
     fn test_convert_ubuntu_base() {
         let dockerfile = "FROM ubuntu:22.04\nRUN apt-get update";
         let yaml = convert_dockerfile_to_distrobuilder(dockerfile);
-        
+
         assert!(yaml.contains("distribution: ubuntu"));
         assert!(yaml.contains("release: 22.04"));
         assert!(yaml.contains("apt-get update"));

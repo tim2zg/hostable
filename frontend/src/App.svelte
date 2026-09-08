@@ -4,9 +4,8 @@
   import LxcManager from './lib/LxcManager.svelte';
   import Converter from './lib/Converter.svelte';
   import Catalog from './lib/Catalog.svelte';
-  import ProxyRouter from './lib/ProxyRouter.svelte';
+  import SecureWebGateway from './lib/SecureWebGateway.svelte';
   import LogViewer from './lib/LogViewer.svelte';
-  import DatabaseManager from './lib/DatabaseManager.svelte';
   import Login from './lib/Login.svelte';
   import Settings from './lib/Settings.svelte';
   import ToastRenderer from './lib/ToastRenderer.svelte';
@@ -71,11 +70,10 @@
     <nav>
       <button class="nav-item {currentView === 'dashboard' ? 'active' : ''}" on:click={() => setView('dashboard')}>📊 Dashboard</button>
       <button class="nav-item {currentView === 'lxc' ? 'active' : ''}" on:click={() => setView('lxc')}>📦 LXC Manager</button>
+      <button class="nav-item {currentView === 'converter' ? 'active' : ''}" on:click={() => setView('converter')}>🚀 Deploy Wizard</button>
       <button class="nav-item {currentView === 'catalog' ? 'active' : ''}" on:click={() => setView('catalog')}>🛒 Catalog (1-Click)</button>
-      <button class="nav-item {currentView === 'converter' ? 'active' : ''}" on:click={() => setView('converter')}>🐳 Custom Deploy</button>
-      <button class="nav-item {currentView === 'proxy' ? 'active' : ''}" on:click={() => setView('proxy')}>🌐 Proxy Routing</button>
+      <button class="nav-item {currentView === 'secureweb' ? 'active' : ''}" on:click={() => setView('secureweb')}>🛡️ SecureWeb Gateway</button>
       <button class="nav-item {currentView === 'logs' ? 'active' : ''}" on:click={() => setView('logs')}>📋 Real-Time Logs</button>
-      <button class="nav-item {currentView === 'db' ? 'active' : ''}" on:click={() => setView('db')}>🗄️ DB Provision</button>
       <button class="nav-item {currentView === 'settings' ? 'active' : ''}" on:click={() => setView('settings')}>⚙️ Settings</button>
     </nav>
     <div class="sidebar-footer">
@@ -92,12 +90,10 @@
       <Converter />
     {:else if currentView === 'catalog'}
       <Catalog />
-    {:else if currentView === 'proxy'}
-      <ProxyRouter />
+    {:else if currentView === 'secureweb'}
+      <SecureWebGateway />
     {:else if currentView === 'logs'}
       <LogViewer />
-    {:else if currentView === 'db'}
-      <DatabaseManager />
     {:else if currentView === 'settings'}
       <Settings />
     {/if}

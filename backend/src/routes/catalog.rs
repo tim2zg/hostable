@@ -1,7 +1,4 @@
-use axum::{
-    extract::State,
-    Json,
-};
+use axum::{Json, extract::State};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -17,7 +14,8 @@ pub async fn get_catalog(_auth: RequireAuth, State(state): State<Arc<AppState>>)
         }
     }
 
-    let url = "https://api.linuxserver.io/api/v1/images?include_config=false&include_deprecated=false";
+    let url =
+        "https://api.linuxserver.io/api/v1/images?include_config=false&include_deprecated=false";
     match reqwest::get(url).await {
         Ok(res) => {
             if let Ok(json) = res.json::<Value>().await {
@@ -28,8 +26,6 @@ pub async fn get_catalog(_auth: RequireAuth, State(state): State<Arc<AppState>>)
                 Json(json!({"status": "error", "error": "Failed to parse catalog JSON"}))
             }
         }
-        Err(e) => {
-            Json(json!({"status": "error", "error": e.to_string()}))
-        }
+        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
     }
 }

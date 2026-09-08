@@ -1,0 +1,141 @@
+---
+# Tasks for lxc_container role
+
+- name: Build Proxmox Auth Headers
+  ansible.builtin.set_fact:
+    pve_headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+      Content-Type: "application/json"
+
+- name: Check if Container {{ lxc_vmid }} already exists
+  ansible.builtin.uri:
+    url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/lxc/{{ lxc_vmid }}/status/current"
+    method: GET
+    headers: "{{ pve_headers }}"
+    validate_certs: false
+    status_code: [200, 404, 500]
+  register: container_check
+
+- name: Set existence fact
+  ansible.builtin.set_fact:
+    container_exists: "{{ container_check.status == 200 }}"
+
+- name: Prepare Mountpoint Parameters
+  ansible.builtin.set_fact:
+    mp_params: >-
+      {%- set res = {} -%}
+      {%- for mp in lxc_mountpoints -%}
+        {%- if mp.host is defined and mp.container is defined -%}
+          {%- set _ = res.update({'mp' ~ loop.index0: mp.host ~ ',mp=' ~ mp.container ~ (',ro=1' if mp.ro | default(false) else '')}) -%}
+        {%- elif mp.storage is defined and mp.container is defined -%}
+          {%- set _ = res.update({'mp' ~ loop.index0: mp.storage ~ ':' ~ mp.size | default('10') ~ ',mp=' ~ mp.container}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ res }}
+
+- name: Create LXC Container if not present
+  when: not container_exists
+  block:
+    - name: Assemble Creation Payload
+      ansible.builtin.set_fact:
+        create_payload: >-
+          {{
+            {
+              'vmid': lxc_vmid | int,
+              'hostname': lxc_hostname,
+              'ostemplate': lxc_template,
+              'cores': lxc_cores | int,
+              'memory': lxc_memory | int,
+              'rootfs': lxc_storage_pool ~ ':' ~ lxc_disk_size | regex_replace('[^0-9]', ''),
+              'net0': 'name=eth0,bridge=' ~ lxc_net_bridge ~ ',ip=' ~ lxc_ip_address ~ (',gw=' ~ lxc_gateway if lxc_gateway | length > 0 else ''),
+              'unprivileged': 1 if lxc_unprivileged else 0,
+              'features': lxc_features,
+              'tags': lxc_tags,
+              'start': 1
+            } | combine(mp_params)
+          }}
+
+    - name: Trigger LXC Creation via Proxmox API
+      ansible.builtin.uri:
+        url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/lxc"
+        method: POST
+        headers: "{{ pve_headers }}"
+        body_format: json
+        body: "{{ create_payload }}"
+        validate_certs: false
+        status_code: [200, 201]
+      register: create_task
+
+    - name: Wait for Creation Task to Complete
+      ansible.builtin.uri:
+        url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/tasks/{{ create_task.json.data }}/status"
+        method: GET
+        headers: "{{ pve_headers }}"
+        validate_certs: false
+      register: task_status
+      until: task_status.json.data.status == 'stopped'
+      retries: 60
+      delay: 2
+
+- name: Update Container Resources if already exists (Zero Data Loss)
+  when: container_exists
+  block:
+    - name: Assemble Update Configuration
+      ansible.builtin.set_fact:
+        update_payload: >-
+          {{
+            {
+              'cores': lxc_cores | int,
+              'memory': lxc_memory | int,
+              'tags': lxc_tags
+            } | combine(mp_params)
+          }}
+
+    - name: Apply Updated Config
+      ansible.builtin.uri:
+        url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/lxc/{{ lxc_vmid }}/config"
+        method: PUT
+        headers: "{{ pve_headers }}"
+        body_format: json
+        body: "{{ update_payload }}"
+        validate_certs: false
+        status_code: 200
+
+- name: Ensure Container is Started
+  ansible.builtin.uri:
+    url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/lxc/{{ lxc_vmid }}/status/start"
+    method: POST
+    headers: "{{ pve_headers }}"
+    validate_certs: false
+    status_code: [200, 500]
+  ignore_errors: true
+
+- name: Query Running Container IP Address
+  ansible.builtin.uri:
+    url: "https://{{ pve_api_host }}:8006/api2/json/nodes/{{ pve_node }}/lxc/{{ lxc_vmid }}/interfaces"
+    method: GET
+    headers: "{{ pve_headers }}"
+    validate_certs: false
+    status_code: [200, 500]
+  register: iface_result
+  retries: 15
+  delay: 2
+  until: iface_result.status == 200 and (iface_result.json.data | default([]) | length > 0)
+  ignore_errors: true
+
+- name: Extract Container IP
+  ansible.builtin.set_fact:
+    discovered_ip: >-
+      {%- set ns = namespace(ip='') -%}
+      {%- if iface_result.json is defined and iface_result.json.data is defined -%}
+        {%- for iface in iface_result.json.data -%}
+          {%- if iface.name != 'lo' and iface.inet is defined -%}
+            {%- set ns.ip = iface.inet.split('/')[0] -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ ns.ip | default(lxc_ip_address.split('/')[0]) }}
+
+- name: Display Container Provisioning Summary
+  ansible.builtin.debug:
+    msg: "LXC {{ lxc_vmid }} ({{ lxc_hostname }}) is active at IP: {{ discovered_ip }}"

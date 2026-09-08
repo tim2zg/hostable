@@ -15,3 +15,9 @@ hostable-manager/
 
 # General
 .DS_Store
+.agents/
+ORIGINAL_REQUEST.md
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
+tests_e2e/

@@ -1,0 +1,19 @@
+[Unit]
+Description=Hostable Managed Service - {{ lxc_service_name }}
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ lxc_working_dir }}
+EnvironmentFile=-/etc/default/{{ lxc_service_name }}
+ExecStart={{ lxc_entrypoint }}
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

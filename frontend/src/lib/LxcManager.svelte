@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { apiGet, apiPost } from './api';
+  import { apiGet, apiPost, apiDelete } from './api';
   import { toasts } from './toast';
   import { Terminal } from 'xterm';
   import { FitAddon } from 'xterm-addon-fit';
@@ -26,6 +26,15 @@
   let metricsChartCanvas: HTMLCanvasElement;
   let metricsChartInstance: any = null;
   let metricsError = '';
+
+  // Snapshot State
+  let showSnapshotModal = false;
+  let activeSnapshotVmid: number | null = null;
+  let snapshots: any[] = [];
+  let isFetchingSnapshots = false;
+  let newSnapshotName = '';
+  let newSnapshotDesc = '';
+  let isCreatingSnapshot = false;
 
   async function fetchContainers() {
     isFetching = true;
@@ -140,6 +149,81 @@
   function handleResize() {
     if (fitAddon) {
       fitAddon.fit();
+    }
+  }
+
+  // Snapshot Logic
+  async function openSnapshots(id: number) {
+    activeSnapshotVmid = id;
+    showSnapshotModal = true;
+    await fetchSnapshots(id);
+  }
+
+  function closeSnapshots() {
+    showSnapshotModal = false;
+    activeSnapshotVmid = null;
+    snapshots = [];
+    newSnapshotName = '';
+    newSnapshotDesc = '';
+  }
+
+  async function fetchSnapshots(id: number) {
+    isFetchingSnapshots = true;
+    try {
+      const res = await apiGet(`/lxcs/${id}/snapshots`);
+      const allSnaps = res.data || [];
+      // Proxmox returns an array where 'current' is the running state, not a real snapshot
+      snapshots = allSnaps.filter((s: any) => s.name !== 'current');
+    } catch(e: any) {
+      toasts.add(`Failed to load snapshots: ${e.message}`, 'error');
+    } finally {
+      isFetchingSnapshots = false;
+    }
+  }
+
+  async function createSnapshot() {
+    if (!newSnapshotName || !activeSnapshotVmid) return;
+    isCreatingSnapshot = true;
+    try {
+      await apiPost(`/lxcs/${activeSnapshotVmid}/snapshots`, {
+        snapname: newSnapshotName,
+        description: newSnapshotDesc
+      });
+      toasts.add('Snapshot created successfully', 'success');
+      newSnapshotName = '';
+      newSnapshotDesc = '';
+      await fetchSnapshots(activeSnapshotVmid);
+    } catch(e: any) {
+      toasts.add(`Failed to create snapshot: ${e.message}`, 'error');
+    } finally {
+      isCreatingSnapshot = false;
+    }
+  }
+
+  async function rollbackSnapshot(snapname: string) {
+    if (!activeSnapshotVmid) return;
+    if (!confirm(`Are you sure you want to rollback to ${snapname}? All changes since this snapshot will be lost!`)) return;
+    
+    try {
+      await apiPost(`/lxcs/${activeSnapshotVmid}/snapshots/${snapname}/rollback`, {});
+      toasts.add(`Rolled back to ${snapname}`, 'success');
+      closeSnapshots();
+      await fetchContainers(); // Refresh statuses
+    } catch(e: any) {
+      toasts.add(`Failed to rollback: ${e.message}`, 'error');
+    }
+  }
+
+  async function deleteSnapshot(snapname: string) {
+    if (!activeSnapshotVmid) return;
+    if (!confirm(`Are you sure you want to delete snapshot ${snapname}?`)) return;
+    
+    try {
+      await apiDelete(`/lxcs/${activeSnapshotVmid}/snapshots/${snapname}`);
+      toasts.add(`Deleted snapshot ${snapname}`, 'success');
+      await fetchSnapshots(activeSnapshotVmid);
+    } catch(e: any) {
+      toasts.add(`Failed to delete snapshot: ${e.message}`, 'error');
     }
   }
 
@@ -471,6 +555,7 @@
               <button class="flat-btn-outline" title="Stop Instance" on:click={() => stopContainer(ct.id)}>⏹ Stop</button>
               <button class="flat-btn-outline" title="Restart Instance" on:click={() => restartContainer(ct.id)}>🔄 Restart</button>
               <button class="flat-btn-primary" title="Open Web Terminal Console" on:click={() => openConsole(ct.id)}>💻 Console</button>
+              <button class="flat-btn-outline" style="border-color: #a855f7; color: #d8b4fe;" title="Snapshots" on:click={() => openSnapshots(ct.id)}>📸 Snapshots</button>
             {:else}
               <button class="flat-btn-primary" title="Start Instance" on:click={() => startContainer(ct.id)}>▶ Start</button>
             {/if}
@@ -526,6 +611,66 @@
             <canvas bind:this={metricsChartCanvas}></canvas>
           </div>
         </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Snapshots Modal -->
+  {#if showSnapshotModal}
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="modal-backdrop" on:click={closeSnapshots}>
+      <div class="flat-card" style="width: 600px; max-width: 90vw; max-height: 85vh; overflow-y: auto;" on:click|stopPropagation>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+          <h2 style="font-size: 1.5rem; color: #f8fafc; margin: 0;">📸 Snapshots for Container #{activeSnapshotVmid}</h2>
+          <button class="close-btn" style="color: #94a3b8; font-size: 1.5rem; background: none; border: none; cursor: pointer;" on:click={closeSnapshots}>×</button>
+        </div>
+
+        <div style="background: rgba(15, 23, 42, 0.5); padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem; border: 1px solid #1e293b;">
+          <h3 style="margin-top: 0; color: #e2e8f0; font-size: 1.1rem; margin-bottom: 1rem;">Create New Snapshot</h3>
+          <div style="display: flex; flex-direction: column; gap: 1rem;">
+            <div>
+              <label for="snapname" style="display: block; color: #94a3b8; margin-bottom: 0.3rem; font-size: 0.9rem;">Snapshot Name (no spaces)</label>
+              <input id="snapname" type="text" class="search-input" style="width: 100%; box-sizing: border-box;" bind:value={newSnapshotName} placeholder="e.g. before-update" />
+            </div>
+            <div>
+              <label for="snapdesc" style="display: block; color: #94a3b8; margin-bottom: 0.3rem; font-size: 0.9rem;">Description (Optional)</label>
+              <input id="snapdesc" type="text" class="search-input" style="width: 100%; box-sizing: border-box;" bind:value={newSnapshotDesc} placeholder="What is this snapshot for?" />
+            </div>
+            <button class="flat-btn-primary" style="align-self: flex-start; background: #a855f7; color: white;" on:click={createSnapshot} disabled={isCreatingSnapshot || !newSnapshotName}>
+              {isCreatingSnapshot ? 'Creating...' : '💾 Take Snapshot'}
+            </button>
+          </div>
+        </div>
+
+        <h3 style="color: #e2e8f0; font-size: 1.1rem; margin-bottom: 1rem; border-bottom: 1px solid #1e293b; padding-bottom: 0.5rem;">Existing Snapshots</h3>
+        
+        {#if isFetchingSnapshots}
+          <div style="text-align: center; padding: 2rem; color: #94a3b8;">Loading snapshots...</div>
+        {:else if snapshots.length === 0}
+          <div style="text-align: center; padding: 2rem; color: #64748b; background: rgba(0,0,0,0.2); border-radius: 8px;">No snapshots found.</div>
+        {:else}
+          <div style="display: flex; flex-direction: column; gap: 0.8rem;">
+            {#each snapshots as snap}
+              <div style="display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 1rem; border-radius: 8px; border: 1px solid #1e293b;">
+                <div>
+                  <div style="font-weight: 600; color: #f8fafc; font-size: 1.1rem;">{snap.name}</div>
+                  {#if snap.description}
+                    <div style="color: #94a3b8; font-size: 0.9rem; margin-top: 0.2rem;">{snap.description}</div>
+                  {/if}
+                  <div style="color: #64748b; font-size: 0.8rem; margin-top: 0.2rem;">
+                    {#if snap.snaptime}
+                      {new Date(snap.snaptime * 1000).toLocaleString()}
+                    {/if}
+                  </div>
+                </div>
+                <div style="display: flex; gap: 0.5rem;">
+                  <button class="flat-btn-primary" style="padding: 0.4rem 0.8rem; font-size: 0.85rem; background: #10b981; color: white;" on:click={() => rollbackSnapshot(snap.name)}>⏪ Restore</button>
+                  <button class="flat-btn-outline" style="padding: 0.4rem 0.8rem; font-size: 0.85rem; border-color: #ef4444; color: #ef4444;" on:click={() => deleteSnapshot(snap.name)}>🗑️ Delete</button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

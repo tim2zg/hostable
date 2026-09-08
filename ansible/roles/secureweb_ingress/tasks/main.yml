@@ -1,0 +1,28 @@
+---
+# Tasks for secureweb_ingress role
+
+- name: Register LXC Upstream with SecureWeb Gateway
+  ansible.builtin.uri:
+    url: "{{ secureweb_gateway_url }}/api/routes"
+    method: POST
+    body_format: json
+    body:
+      domain: "{{ secureweb_domain }}"
+      target_ip: "{{ discovered_ip }}"
+      target_port: "{{ secureweb_port | int }}"
+      service_name: "{{ lxc_hostname }}"
+      vmid: "{{ lxc_vmid | int }}"
+      mode: "zero-trust"
+    validate_certs: false
+    status_code: [200, 201, 204]
+  register: sw_register
+  ignore_errors: true
+
+- name: Log SecureWeb Registration Result
+  ansible.builtin.debug:
+    msg: >-
+      {%- if sw_register.failed | default(false) -%}
+        "SecureWeb Gateway registration skipped or endpoint unreachable at {{ secureweb_gateway_url }}. Domain {{ secureweb_domain }} will require manual route linking."
+      {%- else -%}
+        "Successfully registered {{ secureweb_domain }} -> {{ discovered_ip }}:{{ secureweb_port }} with SecureWeb Gateway!"
+      {%- endif -%}

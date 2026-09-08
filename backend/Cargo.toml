@@ -24,3 +24,5 @@ mime_guess = "2.0"
 local-ip-address = "0.6.3"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 futures = "0.3.32"
+tokio-tungstenite = { version = "0.24", features = ["native-tls-vendored"] }
+native-tls = "0.2"

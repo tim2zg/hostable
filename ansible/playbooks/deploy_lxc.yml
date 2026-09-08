@@ -1,0 +1,57 @@
+---
+# ==============================================================================
+# Hostable: Automated Invisible LXC Deployment Playbook
+# ==============================================================================
+- name: Deploy and Configure LXC Container on Proxmox
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Inputs injected dynamically by Hostable's Ansible Runner
+    pve_api_host: "{{ proxmox_host | default('127.0.0.1') }}"
+    pve_api_user: "{{ proxmox_user | default('root@pam') }}"
+    pve_api_token_id: "{{ proxmox_token_id | default('') }}"
+    pve_api_token_secret: "{{ proxmox_token_secret | default('') }}"
+    pve_node: "{{ node | default('pve') }}"
+    
+    lxc_vmid: "{{ vmid }}"
+    lxc_hostname: "{{ hostname }}"
+    lxc_template: "{{ ostemplate }}"
+    lxc_cores: "{{ cores | default(2) }}"
+    lxc_memory: "{{ memory | default(1024) }}"
+    lxc_disk_size: "{{ disk_size | default('8G') }}"
+    lxc_storage_pool: "{{ storage_pool | default('local-zfs') }}"
+    lxc_net_bridge: "{{ net_bridge | default('vmbr0') }}"
+    lxc_ip_address: "{{ ip_address | default('dhcp') }}"
+    lxc_gateway: "{{ gateway | default('') }}"
+    lxc_unprivileged: "{{ unprivileged | default(true) }}"
+    lxc_features: "{{ features | default('nesting=1') }}"
+    lxc_tags: "{{ tags | default('hostable,managed') }}"
+
+    # Persistent Storage Mountpoints (format: [{ host: "/mnt/data", container: "/data", size: "10G" }])
+    lxc_mountpoints: "{{ mountpoints | default([]) }}"
+    
+    # Environment variables
+    lxc_env_vars: "{{ env_vars | default({}) }}"
+
+    # Service & Entrypoint details extracted from OCI
+    lxc_service_name: "{{ service_name | default(hostname) }}"
+    lxc_entrypoint: "{{ entrypoint | default('/bin/sh') }}"
+    lxc_working_dir: "{{ working_dir | default('/') }}"
+
+    # SecureWeb Gateway Integration
+    secureweb_enabled: "{{ expose_secureweb | default(false) }}"
+    secureweb_gateway_url: "{{ secureweb_url | default('http://127.0.0.1:3000') }}"
+    secureweb_domain: "{{ secureweb_domain | default('') }}"
+    secureweb_port: "{{ app_port | default(80) }}"
+
+  tasks:
+    - name: Ensure LXC Container is provisioned
+      ansible.builtin.include_role:
+        name: lxc_container
+
+    - name: Register Service with SecureWeb Gateway
+      ansible.builtin.include_role:
+        name: secureweb_ingress
+      when: secureweb_enabled | bool and secureweb_domain | length > 0

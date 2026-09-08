@@ -1,11 +1,11 @@
 #![allow(dead_code, unused_variables, unused_imports)]
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::io::{self, Cursor, Read};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
-use serde::Deserialize;
-use tar::Archive;
 use flate2::read::GzDecoder;
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::Deserialize;
+use std::fs;
+use std::io::{self, Cursor, Read};
+use std::path::{Path, PathBuf};
+use tar::Archive;
 
 // ==============================================================================
 // Data Models
@@ -28,6 +28,24 @@ enum ManifestResponse {
 #[derive(Deserialize, Debug)]
 struct SingleManifest {
     layers: Vec<Descriptor>,
+    config: Descriptor,
+}
+
+#[derive(Deserialize, Debug)]
+struct ImageConfigBlob {
+    config: ConfigContainer,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ConfigContainer {
+    #[serde(rename = "Env", default)]
+    pub env: Vec<String>,
+    #[serde(rename = "Cmd", default)]
+    pub cmd: Option<Vec<String>>,
+    #[serde(rename = "Entrypoint", default)]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir", default)]
+    pub working_dir: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -69,19 +87,26 @@ impl OciImageRef {
     /// Parses an image reference string like "ubuntu:latest" or "ghcr.io/owner/repo:tag"
     pub fn parse(img_ref: &str) -> Result<Self, String> {
         let parts: Vec<&str> = img_ref.split('/').collect();
-        let (registry, repo_part) = if parts.len() > 1 && (parts[0].contains('.') || parts[0].contains(':')) {
-            // First part contains dots or colons, so it's a registry domain (e.g. ghcr.io)
-            (parts[0].to_string(), parts[1..].join("/"))
-        } else {
-            // Default to Docker Hub
-            ("registry-1.docker.io".to_string(), img_ref.to_string())
-        };
+        let (registry, repo_part) =
+            if parts.len() > 1 && (parts[0].contains('.') || parts[0].contains(':')) {
+                // First part contains dots or colons, so it's a registry domain (e.g. ghcr.io)
+                (parts[0].to_string(), parts[1..].join("/"))
+            } else {
+                // Default to Docker Hub
+                ("registry-1.docker.io".to_string(), img_ref.to_string())
+            };
 
         // Split repository and tag/digest
         let (mut repository, tag) = if let Some(idx) = repo_part.rfind('@') {
-            (repo_part[..idx].to_string(), repo_part[idx + 1..].to_string())
+            (
+                repo_part[..idx].to_string(),
+                repo_part[idx + 1..].to_string(),
+            )
         } else if let Some(idx) = repo_part.rfind(':') {
-            (repo_part[..idx].to_string(), repo_part[idx + 1..].to_string())
+            (
+                repo_part[..idx].to_string(),
+                repo_part[idx + 1..].to_string(),
+            )
         } else {
             (repo_part, "latest".to_string())
         };
@@ -121,7 +146,7 @@ struct ImageState {
 fn compress_to_tar_xz(
     src_dir: &Path,
     out_file: &Path,
-    file_map: &HashMap<String, PosixMetadata>
+    file_map: &HashMap<String, PosixMetadata>,
 ) -> io::Result<()> {
     let tar_xz = std::fs::File::create(out_file)?;
     let enc = xz2::write::XzEncoder::new(tar_xz, 6);
@@ -140,13 +165,13 @@ fn compress_to_tar_xz(
         header.set_gid(meta.gid);
         header.set_size(meta.size);
         header.set_mtime(meta.mtime);
-        
+
         if let Some(link) = &meta.link_name {
             if let Err(e) = header.set_link_name(link) {
                 tracing::warn!("Failed to set link name {}: {}", link, e);
             }
         }
-        
+
         header.set_cksum();
 
         let etype = tar::EntryType::new(meta.entry_type);
@@ -190,16 +215,22 @@ impl OciExtractor {
     }
 
     /// Fetches the dynamic authentication token required to access the registry repository.
-    async fn fetch_token(&self, img: &OciImageRef) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn fetch_token(
+        &self,
+        img: &OciImageRef,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // 1. Try to ping the registry manifests endpoint unauthenticated to discover auth server via Www-Authenticate header
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
             img.registry, img.repository, img.tag
         );
 
-        tracing::info!("Discovering authentication endpoint for {}...", img.registry);
+        tracing::info!(
+            "Discovering authentication endpoint for {}...",
+            img.registry
+        );
         let res = self.client.get(&url).send().await?;
-        
+
         if res.status().is_success() {
             // No auth required (very rare, but possible)
             return Ok(String::new());
@@ -207,7 +238,11 @@ impl OciExtractor {
 
         let auth_header = match res.headers().get("Www-Authenticate") {
             Some(h) => h.to_str()?,
-            None => return Err("Registry returned unauthorized but provided no Www-Authenticate header".into()),
+            None => {
+                return Err(
+                    "Registry returned unauthorized but provided no Www-Authenticate header".into(),
+                );
+            }
         };
 
         // Parse header: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="..."
@@ -238,32 +273,38 @@ impl OciExtractor {
         };
 
         // 2. Fetch the token from the authentication server
-        let mut token_url = format!(
-            "{}?scope=repository:{}:pull",
-            realm, img.repository
-        );
+        let mut token_url = format!("{}?scope=repository:{}:pull", realm, img.repository);
         if let Some(srv) = service {
             token_url.push_str(&format!("&service={}", srv));
         }
 
         tracing::info!("Fetching pull token from: {}...", token_url);
         let token_res = self.client.get(&token_url).send().await?;
-        
+
         if !token_res.status().is_success() {
             return Err(format!("Failed to retrieve token: {}", token_res.status()).into());
         }
 
         let payload: TokenResponse = token_res.json().await?;
-        let token = payload.token.or(payload.access_token).ok_or("No token returned in auth server payload")?;
+        let token = payload
+            .token
+            .or(payload.access_token)
+            .ok_or("No token returned in auth server payload")?;
 
         Ok(token)
     }
 
     /// Pulls the manifests and downloads all OCI image layers, extracting them to a target directory.
-    pub async fn extract_to_dir(&self, image_str: &str, target_path: &Path, env_vars: Option<&[String]>) -> Result<UpdateStatus, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn extract_to_dir(
+        &self,
+        image_str: &str,
+        target_path: &Path,
+        env_vars: Option<&[String]>,
+        extra_files: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<UpdateStatus, Box<dyn std::error::Error + Send + Sync>> {
         let img = OciImageRef::parse(image_str)?;
         let token = self.fetch_token(&img).await?;
-        
+
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -282,8 +323,10 @@ impl OciExtractor {
             img.registry, img.repository, img.tag
         );
         tracing::info!("Downloading manifest from {}...", manifest_url);
-        
-        let res = self.client.get(&manifest_url)
+
+        let res = self
+            .client
+            .get(&manifest_url)
             .headers(headers.clone())
             .send()
             .await?;
@@ -293,7 +336,7 @@ impl OciExtractor {
         }
 
         let manifest_response: ManifestResponse = res.json().await?;
-        
+
         // Resolve Manifest List to a single arch manifest if needed
         let manifest = match manifest_response {
             ManifestResponse::Single(single) => single,
@@ -307,20 +350,29 @@ impl OciExtractor {
                             .collect();
                         format!("No matching amd64/linux platform found in manifest list. Available platforms: {:?}", available_archs)
                     })?;
-                
+
                 let digest_url = format!(
                     "https://{}/v2/{}/manifests/{}",
                     img.registry, img.repository, target.digest
                 );
-                tracing::info!("Resolving architecture-specific manifest [amd64/linux] from {}...", &target.digest[..12]);
-                
-                let res = self.client.get(&digest_url)
+                tracing::info!(
+                    "Resolving architecture-specific manifest [amd64/linux] from {}...",
+                    &target.digest[..12]
+                );
+
+                let res = self
+                    .client
+                    .get(&digest_url)
                     .headers(headers.clone())
                     .send()
                     .await?;
 
                 if !res.status().is_success() {
-                    return Err(format!("Failed to fetch resolved single manifest: {}", res.status()).into());
+                    return Err(format!(
+                        "Failed to fetch resolved single manifest: {}",
+                        res.status()
+                    )
+                    .into());
                 }
 
                 let single: SingleManifest = res.json().await?;
@@ -329,7 +381,10 @@ impl OciExtractor {
         };
 
         let new_layers: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
-        tracing::info!("Found {} layers in resolved image manifest.", manifest.layers.len());
+        tracing::info!(
+            "Found {} layers in resolved image manifest.",
+            manifest.layers.len()
+        );
 
         let cache_dir = PathBuf::from(format!("{}.cache", target_path.display()));
         let meta_file = PathBuf::from(format!("{}.cache.meta", target_path.display()));
@@ -371,7 +426,7 @@ impl OciExtractor {
             tracing::info!("Image hasn't changed. Using existing cache...");
             if !target_path.exists() {
                 tracing::info!("Compressing rootfs to {}...", target_path.display());
-                
+
                 if let Some(envs) = env_vars {
                     if !envs.is_empty() {
                         let profile_dir = cache_dir.join("etc").join("profile.d");
@@ -387,20 +442,48 @@ impl OciExtractor {
                             uid: 0,
                             gid: 0,
                             size: content.len() as u64,
-                            mtime: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                            mtime: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
                             link_name: None,
                         };
                         file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
                     }
                 }
-                
+
+                if let Some(files) = &extra_files {
+                    for (path_str, content) in files {
+                        let full_path = cache_dir.join(path_str);
+                        if let Some(p) = full_path.parent() {
+                            let _ = fs::create_dir_all(p);
+                        }
+                        let _ = fs::write(&full_path, content);
+                        let meta = PosixMetadata {
+                            entry_type: b'0',
+                            mode: 0o755,
+                            uid: 0,
+                            gid: 0,
+                            size: content.len() as u64,
+                            mtime: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            link_name: None,
+                        };
+                        file_map.insert(path_str.trim_start_matches('/').to_string(), meta);
+                    }
+                }
+
                 compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
             }
             return Ok(UpdateStatus::Unchanged);
         }
 
         let final_status = if needs_recreate {
-            tracing::info!("Base layers changed or cache missing. Recreating container from scratch...");
+            tracing::info!(
+                "Base layers changed or cache missing. Recreating container from scratch..."
+            );
             if cache_dir.exists() {
                 fs::remove_dir_all(&cache_dir)?;
             }
@@ -427,7 +510,9 @@ impl OciExtractor {
                 img.registry, img.repository, layer.digest
             );
 
-            let blob_res = self.client.get(&blob_url)
+            let blob_res = self
+                .client
+                .get(&blob_url)
                 .headers(headers.clone())
                 .send()
                 .await?;
@@ -439,20 +524,23 @@ impl OciExtractor {
             // Stream response bytes directly into memory buffer to avoid writing temporary files
             let bytes = blob_res.bytes().await?;
             let cursor = Cursor::new(bytes);
-            
+
             // Extract the tar.gz stream directly
             extract_layer_stream(cursor, &cache_dir, &mut file_map)?;
         }
 
         // Save metadata
-        let state = ImageState { 
+        let state = ImageState {
             layers: new_layers,
-            files: file_map.clone()
+            files: file_map.clone(),
         };
         fs::write(&meta_file, serde_json::to_string(&state)?)?;
 
-        tracing::info!("Extract completed successfully. Compressing rootfs to {}...", target_path.display());
-        
+        tracing::info!(
+            "Extract completed successfully. Compressing rootfs to {}...",
+            target_path.display()
+        );
+
         if let Some(envs) = env_vars {
             if !envs.is_empty() {
                 let profile_dir = cache_dir.join("etc").join("profile.d");
@@ -468,16 +556,313 @@ impl OciExtractor {
                     uid: 0,
                     gid: 0,
                     size: content.len() as u64,
-                    mtime: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    mtime: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
                     link_name: None,
                 };
                 file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
             }
         }
-        
+
+        if let Some(files) = &extra_files {
+            for (path_str, content) in files {
+                let full_path = cache_dir.join(path_str);
+                if let Some(p) = full_path.parent() {
+                    let _ = fs::create_dir_all(p);
+                }
+                let _ = fs::write(&full_path, content);
+                let meta = PosixMetadata {
+                    entry_type: b'0',
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    size: content.len() as u64,
+                    mtime: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    link_name: None,
+                };
+                file_map.insert(path_str.trim_start_matches('/').to_string(), meta);
+            }
+        }
+
         compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
 
         Ok(final_status)
+    }
+
+    pub async fn get_image_config(
+        &self,
+        image_str: &str,
+    ) -> Result<ConfigContainer, Box<dyn std::error::Error + Send + Sync>> {
+        let img = OciImageRef::parse(image_str)?;
+        let token = self.fetch_token(&img).await?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json"),
+        );
+        if !token.is_empty() {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token))?,
+            );
+        }
+
+        let manifest_url = format!(
+            "https://{}/v2/{}/manifests/{}",
+            img.registry, img.repository, img.tag
+        );
+        let res = self
+            .client
+            .get(&manifest_url)
+            .headers(headers.clone())
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            return Err(format!(
+                "Failed to fetch manifest for {}: {}",
+                image_str,
+                res.status()
+            )
+            .into());
+        }
+
+        let manifest_response: ManifestResponse = res.json().await?;
+        let manifest = match manifest_response {
+            ManifestResponse::Single(single) => single,
+            ManifestResponse::List(list) => {
+                let target = list
+                    .manifests
+                    .iter()
+                    .find(|m| m.platform.architecture == "amd64" && m.platform.os == "linux")
+                    .ok_or_else(|| {
+                        format!(
+                            "No amd64/linux platform found in manifest list for {}",
+                            image_str
+                        )
+                    })?;
+
+                let digest_url = format!(
+                    "https://{}/v2/{}/manifests/{}",
+                    img.registry, img.repository, target.digest
+                );
+                let res = self
+                    .client
+                    .get(&digest_url)
+                    .headers(headers.clone())
+                    .send()
+                    .await?;
+                if !res.status().is_success() {
+                    return Err(format!(
+                        "Failed to resolve manifest for {}: {}",
+                        image_str,
+                        res.status()
+                    )
+                    .into());
+                }
+                res.json().await?
+            }
+        };
+
+        self.fetch_config_blob(image_str, &manifest.config.digest)
+            .await
+    }
+
+    pub async fn fetch_config_blob(
+        &self,
+        image_str: &str,
+        digest: &str,
+    ) -> Result<ConfigContainer, Box<dyn std::error::Error + Send + Sync>> {
+        let img = OciImageRef::parse(image_str)?;
+        let token = self.fetch_token(&img).await?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.docker.container.image.v1+json, application/vnd.oci.image.config.v1+json"));
+        if !token.is_empty() {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token))?,
+            );
+        }
+
+        let blob_url = format!(
+            "https://{}/v2/{}/blobs/{}",
+            img.registry, img.repository, digest
+        );
+        let res = self.client.get(&blob_url).headers(headers).send().await?;
+        if !res.status().is_success() {
+            return Err(format!("Failed to fetch config blob: {}", res.status()).into());
+        }
+
+        let config_blob: ImageConfigBlob = res.json().await?;
+        Ok(config_blob.config)
+    }
+
+    /// Extracts multiple images into a single directory sequentially, effectively merging their filesystems.
+    pub async fn extract_multiple_to_dir(
+        &self,
+        image_strs: &[String],
+        target_path: &Path,
+        extra_files: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<UpdateStatus, Box<dyn std::error::Error + Send + Sync>> {
+        let cache_dir = PathBuf::from(format!("{}.cache", target_path.display()));
+
+        if cache_dir.exists() {
+            fs::remove_dir_all(&cache_dir)?;
+        }
+        fs::create_dir_all(&cache_dir)?;
+
+        let mut master_file_map: HashMap<String, PosixMetadata> = HashMap::new();
+
+        for (idx, image_str) in image_strs.iter().enumerate() {
+            tracing::info!(
+                "--- Merging Image {}/{} [{}] ---",
+                idx + 1,
+                image_strs.len(),
+                image_str
+            );
+
+            let img = OciImageRef::parse(image_str)?;
+            let token = self.fetch_token(&img).await?;
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json"),
+            );
+            if !token.is_empty() {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", token))?,
+                );
+            }
+
+            let manifest_url = format!(
+                "https://{}/v2/{}/manifests/{}",
+                img.registry, img.repository, img.tag
+            );
+            let res = self
+                .client
+                .get(&manifest_url)
+                .headers(headers.clone())
+                .send()
+                .await?;
+            if !res.status().is_success() {
+                return Err(format!(
+                    "Failed to fetch manifest for {}: {}",
+                    image_str,
+                    res.status()
+                )
+                .into());
+            }
+
+            let manifest_response: ManifestResponse = res.json().await?;
+            let manifest = match manifest_response {
+                ManifestResponse::Single(single) => single,
+                ManifestResponse::List(list) => {
+                    let target = list
+                        .manifests
+                        .iter()
+                        .find(|m| m.platform.architecture == "amd64" && m.platform.os == "linux")
+                        .ok_or_else(|| {
+                            format!(
+                                "No amd64/linux platform found in manifest list for {}",
+                                image_str
+                            )
+                        })?;
+
+                    let digest_url = format!(
+                        "https://{}/v2/{}/manifests/{}",
+                        img.registry, img.repository, target.digest
+                    );
+                    let res = self
+                        .client
+                        .get(&digest_url)
+                        .headers(headers.clone())
+                        .send()
+                        .await?;
+                    if !res.status().is_success() {
+                        return Err(format!(
+                            "Failed to resolve manifest for {}: {}",
+                            image_str,
+                            res.status()
+                        )
+                        .into());
+                    }
+                    res.json().await?
+                }
+            };
+
+            for (lidx, layer) in manifest.layers.iter().enumerate() {
+                tracing::info!(
+                    "Processing Layer {}/{} [Digest: {}]...",
+                    lidx + 1,
+                    manifest.layers.len(),
+                    &layer.digest[..12]
+                );
+                let blob_url = format!(
+                    "https://{}/v2/{}/blobs/{}",
+                    img.registry, img.repository, layer.digest
+                );
+                let blob_res = self
+                    .client
+                    .get(&blob_url)
+                    .headers(headers.clone())
+                    .send()
+                    .await?;
+                if !blob_res.status().is_success() {
+                    return Err(format!("Failed to fetch layer blob: {}", blob_res.status()).into());
+                }
+
+                let bytes = blob_res.bytes().await?;
+                let cursor = Cursor::new(bytes);
+                extract_layer_stream(cursor, &cache_dir, &mut master_file_map)?;
+            }
+        }
+
+        if let Some(files) = extra_files {
+            for (path_str, content) in files {
+                let full_path = cache_dir.join(&path_str);
+                if let Some(p) = full_path.parent() {
+                    let _ = fs::create_dir_all(p);
+                }
+
+                let mut meta = PosixMetadata {
+                    entry_type: b'0',
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    size: content.len() as u64,
+                    mtime: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    link_name: None,
+                };
+
+                if content.starts_with("symlink:") {
+                    let target = content.trim_start_matches("symlink:").to_string();
+                    meta.entry_type = b'2'; // Symlink
+                    meta.link_name = Some(target);
+                    meta.size = 0;
+                    // Don't write file content if it's a symlink in tar
+                } else {
+                    let _ = fs::write(&full_path, &content);
+                }
+
+                master_file_map.insert(path_str.trim_start_matches('/').to_string(), meta);
+            }
+        }
+
+        tracing::info!("All images extracted and merged! Compressing merged rootfs...");
+        compress_to_tar_xz(&cache_dir, target_path, &master_file_map)?;
+
+        Ok(UpdateStatus::Recreated)
     }
 }
 
@@ -486,9 +871,9 @@ impl OciExtractor {
 // ==============================================================================
 
 fn extract_layer_stream<R: Read>(
-    stream: R, 
+    stream: R,
     target_dir: &Path,
-    file_map: &mut HashMap<String, PosixMetadata>
+    file_map: &mut HashMap<String, PosixMetadata>,
 ) -> io::Result<()> {
     let dec = GzDecoder::new(stream);
     let mut archive = Archive::new(dec);
@@ -503,8 +888,12 @@ fn extract_layer_stream<R: Read>(
             if file_name == ".wh..wh..opq" {
                 if let Some(parent) = path.parent() {
                     let parent_str = parent.to_string_lossy().replace("\\", "/");
-                    let prefix = if parent_str.is_empty() { String::new() } else { format!("{}/", parent_str) };
-                    
+                    let prefix = if parent_str.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", parent_str)
+                    };
+
                     file_map.retain(|k, _| {
                         if parent_str.is_empty() {
                             false // Wipe everything
@@ -515,7 +904,10 @@ fn extract_layer_stream<R: Read>(
 
                     let target_parent = target_dir.join(parent);
                     if target_parent.exists() {
-                        tracing::debug!("Handling opaque whiteout: cleaning parent folder {}", parent.display());
+                        tracing::debug!(
+                            "Handling opaque whiteout: cleaning parent folder {}",
+                            parent.display()
+                        );
                         fs::remove_dir_all(&target_parent)?;
                         fs::create_dir_all(&target_parent)?;
                     }
@@ -530,12 +922,15 @@ fn extract_layer_stream<R: Read>(
                 let target_path = parent.join(target_name);
                 let target_str = target_path.to_string_lossy().replace("\\", "/");
                 let prefix = format!("{}/", target_str);
-                
+
                 file_map.retain(|k, _| !(k.starts_with(&prefix) || k == &target_str));
 
                 let path_to_delete = target_dir.join(&target_path);
                 if path_to_delete.exists() {
-                    tracing::debug!("Handling whiteout deletion: removing {}", path_to_delete.display());
+                    tracing::debug!(
+                        "Handling whiteout deletion: removing {}",
+                        path_to_delete.display()
+                    );
                     if path_to_delete.is_dir() {
                         fs::remove_dir_all(&path_to_delete)?;
                     } else {
@@ -555,13 +950,17 @@ fn extract_layer_stream<R: Read>(
             gid: header.gid().unwrap_or(0),
             size: header.size().unwrap_or(0),
             mtime: header.mtime().unwrap_or(0),
-            link_name: header.link_name().ok().flatten().map(|p| p.to_string_lossy().to_string()),
+            link_name: header
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|p| p.to_string_lossy().to_string()),
         };
         file_map.insert(path_str.clone(), meta);
 
         // Standard OCI File/Directory unpacking to Windows cache
         let out_path = target_dir.join(&path);
-        
+
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -640,7 +1039,7 @@ mod tests {
         // 1. Setup pre-existing folder & files representing a previous layer
         let dummy_dir = target_dir.join("etc/nginx");
         fs::create_dir_all(&dummy_dir).unwrap();
-        
+
         let dummy_file1 = dummy_dir.join("nginx.conf");
         let dummy_file2 = dummy_dir.join("mime.types");
         fs::write(&dummy_file1, "contents").unwrap();
@@ -653,9 +1052,13 @@ mod tests {
         let path_to_delete = target_dir.join("etc/nginx/.wh.nginx.conf");
         let file_name = path_to_delete.file_name().unwrap().to_str().unwrap();
         assert!(file_name.starts_with(".wh."));
-        
+
         let target_name = &file_name[4..];
-        let parent = path_to_delete.parent().unwrap().strip_prefix(&target_dir).unwrap();
+        let parent = path_to_delete
+            .parent()
+            .unwrap()
+            .strip_prefix(&target_dir)
+            .unwrap();
         let path_to_rm = target_dir.join(parent).join(target_name);
 
         if path_to_rm.exists() {
