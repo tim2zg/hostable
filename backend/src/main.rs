@@ -38,6 +38,7 @@ pub struct AppState {
     pub default_node: String,
     pub ansible: Arc<ansible::AnsibleEngine>,
     pub secureweb: Arc<secureweb::SecureWebClient>,
+    pub deployment_lock: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Parser)]
@@ -128,6 +129,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let default_node = proxmox_client.get_default_node().await;
             let ansible_engine = Arc::new(ansible::AnsibleEngine::new());
             let secureweb_client = Arc::new(secureweb::SecureWebClient::new());
+            let deployment_lock = Arc::new(tokio::sync::Semaphore::new(1));
+
+            // Startup cache hygiene: prune stale temporary artifacts older than 1 hour
+            let cache_path = std::path::PathBuf::from("/cache");
+            if cache_path.exists() {
+                oci::prune_stale_cache_files(&cache_path, 3600);
+            } else {
+                let local_cache = std::path::PathBuf::from("./cache");
+                oci::prune_stale_cache_files(&local_cache, 3600);
+            }
 
             let shared_state = Arc::new(AppState {
                 proxmox: proxmox_client,
@@ -136,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_node,
                 ansible: ansible_engine,
                 secureweb: secureweb_client,
+                deployment_lock,
             });
 
             let cors = CorsLayer::new()

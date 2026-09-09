@@ -44,6 +44,19 @@ pub async fn deploy_lxc_endpoint(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
     Json(payload): Json<DeployRequest>,
 ) -> impl IntoResponse {
+    let _permit = match state.deployment_lock.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DeployResponse {
+                    status: "error".to_string(),
+                    message: format!("Failed to acquire deployment lock: {}", e),
+                }),
+            );
+        }
+    };
+
     let node = state.default_node.clone();
 
     // 1. Process DB Provisioning
@@ -88,6 +101,10 @@ pub async fn deploy_lxc_endpoint(
                 .await
             {
                 Ok(_) => {
+                    // Clean up local tar.xz template immediately after upload
+                    if out_path.exists() {
+                        let _ = std::fs::remove_file(&out_path);
+                    }
                     // 4. Create LXC
                     let mut params = std::collections::HashMap::new();
                     params.insert("vmid".to_string(), payload.vmid.to_string());
@@ -301,6 +318,19 @@ pub async fn deploy_stack_endpoint(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
     Json(payload): Json<DeployStackRequest>,
 ) -> impl IntoResponse {
+    let _permit = match state.deployment_lock.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DeployResponse {
+                    status: "error".to_string(),
+                    message: format!("Failed to acquire deployment lock: {}", e),
+                }),
+            );
+        }
+    };
+
     let node = state.default_node.clone();
 
     // Always start with Alpine as the base OS to provide OpenRC /sbin/init
@@ -394,6 +424,9 @@ pub async fn deploy_stack_endpoint(
                 .await
             {
                 Ok(_) => {
+                    if out_path.exists() {
+                        let _ = std::fs::remove_file(&out_path);
+                    }
                     let mut params = std::collections::HashMap::new();
                     params.insert("vmid".to_string(), payload.vmid.to_string());
                     params.insert(

@@ -169,6 +169,41 @@ pub async fn execute_deployment(
         )
         .await;
 
+    // Acquire global deployment semaphore to prevent concurrent race conditions
+    engine
+        .emit_event(
+            &task_id,
+            "task",
+            "QUEUE",
+            "Waiting for global deployment permit...",
+        )
+        .await;
+
+    let _permit = match state.deployment_lock.acquire().await {
+        Ok(p) => {
+            engine
+                .emit_event(
+                    &task_id,
+                    "ok",
+                    "QUEUE",
+                    "Deployment permit acquired. Starting provisioning pipeline.",
+                )
+                .await;
+            p
+        }
+        Err(e) => {
+            engine
+                .emit_event(
+                    &task_id,
+                    "failed",
+                    "QUEUE",
+                    &format!("Failed to acquire deployment lock: {}", e),
+                )
+                .await;
+            return;
+        }
+    };
+
     let node = state.default_node.clone();
     let template_storage = params.storage_pool.clone();
     let filename = format!("hostable_vmid_{}.tar.xz", params.vmid);
@@ -238,6 +273,10 @@ pub async fn execute_deployment(
                             "Template successfully registered in Proxmox storage.",
                         )
                         .await;
+                    // Clean up local tar.xz template immediately after upload to prevent disk leak
+                    if out_path.exists() {
+                        let _ = std::fs::remove_file(&out_path);
+                    }
                 }
                 Err(e) => {
                     engine
@@ -248,6 +287,9 @@ pub async fn execute_deployment(
                             &format!("Template upload warning (might exist): {}", e),
                         )
                         .await;
+                    if out_path.exists() {
+                        let _ = std::fs::remove_file(&out_path);
+                    }
                 }
             }
         }

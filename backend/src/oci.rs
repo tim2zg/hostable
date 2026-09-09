@@ -1,11 +1,13 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 use flate2::read::GzDecoder;
+use futures::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use tar::Archive;
+use tokio::io::AsyncWriteExt;
 
 // ==============================================================================
 // Data Models
@@ -149,7 +151,8 @@ fn compress_to_tar_xz(
     file_map: &HashMap<String, PosixMetadata>,
 ) -> io::Result<()> {
     let tar_xz = std::fs::File::create(out_file)?;
-    let enc = xz2::write::XzEncoder::new(tar_xz, 6);
+    // Use fast level 2 compression to avoid excessive CPU usage and timeouts
+    let enc = xz2::write::XzEncoder::new(tar_xz, 2);
     let mut builder = tar::Builder::new(enc);
 
     // Sort paths to ensure deterministic tar order and parents before children
@@ -190,6 +193,27 @@ fn compress_to_tar_xz(
     }
 
     builder.into_inner()?.finish()?;
+    Ok(())
+}
+
+/// Offload compression to a blocking threadpool so the Tokio async reactor is never starved,
+/// and immediately prune the temporary unpacked cache folder upon completion.
+async fn compress_and_cleanup(
+    cache_dir: PathBuf,
+    target_path: PathBuf,
+    file_map: HashMap<String, PosixMetadata>,
+) -> io::Result<()> {
+    let cache_dir_clone = cache_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        compress_to_tar_xz(&cache_dir_clone, &target_path, &file_map)
+    })
+    .await
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Compression join error: {}", e)))??;
+
+    if cache_dir.exists() {
+        tracing::debug!("Cleaning up unpacked cache directory: {}", cache_dir.display());
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
     Ok(())
 }
 
@@ -650,7 +674,7 @@ impl OciExtractor {
                     extra_files.as_ref(),
                     &mut file_map,
                 );
-                compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
+                compress_and_cleanup(cache_dir.clone(), target_path.to_path_buf(), file_map.clone()).await?;
             }
             return Ok(UpdateStatus::Unchanged);
         }
@@ -685,7 +709,7 @@ impl OciExtractor {
                 img.registry, img.repository, layer.digest
             );
 
-            let blob_res = self
+            let mut blob_res = self
                 .client
                 .get(&blob_url)
                 .headers(headers.clone())
@@ -696,12 +720,23 @@ impl OciExtractor {
                 return Err(format!("Failed to fetch layer blob: {}", blob_res.status()).into());
             }
 
-            // Stream response bytes directly into memory buffer to avoid writing temporary files
-            let bytes = blob_res.bytes().await?;
-            let cursor = Cursor::new(bytes);
+            // Stream response chunks to a temporary file on disk to prevent RAM OOM
+            let clean_digest = layer.digest.replace(':', "_");
+            let tmp_layer_name = format!(".layer_{}.tmp", &clean_digest[..clean_digest.len().min(16)]);
+            let tmp_layer_path = cache_dir.join(&tmp_layer_name);
 
-            // Extract the tar.gz stream directly
-            extract_layer_stream(cursor, &cache_dir, &mut file_map)?;
+            let mut tmp_file = tokio::fs::File::create(&tmp_layer_path).await?;
+            while let Some(chunk) = blob_res.chunk().await? {
+                tmp_file.write_all(&chunk).await?;
+            }
+            tmp_file.flush().await?;
+            drop(tmp_file);
+
+            // Extract the tar.gz stream directly from disk file
+            let file = std::fs::File::open(&tmp_layer_path)?;
+            let extract_res = extract_layer_stream(file, &cache_dir, &mut file_map);
+            let _ = std::fs::remove_file(&tmp_layer_path);
+            extract_res?;
         }
 
         // Save metadata
@@ -724,7 +759,7 @@ impl OciExtractor {
             &mut file_map,
         );
 
-        compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
+        compress_and_cleanup(cache_dir, target_path.to_path_buf(), file_map).await?;
 
         Ok(final_status)
     }
@@ -944,7 +979,7 @@ impl OciExtractor {
                     "https://{}/v2/{}/blobs/{}",
                     img.registry, img.repository, layer.digest
                 );
-                let blob_res = self
+                let mut blob_res = self
                     .client
                     .get(&blob_url)
                     .headers(headers.clone())
@@ -954,9 +989,23 @@ impl OciExtractor {
                     return Err(format!("Failed to fetch layer blob: {}", blob_res.status()).into());
                 }
 
-                let bytes = blob_res.bytes().await?;
-                let cursor = Cursor::new(bytes);
-                extract_layer_stream(cursor, &cache_dir, &mut master_file_map)?;
+                // Stream response chunks to a temporary file on disk to prevent RAM OOM
+                let clean_digest = layer.digest.replace(':', "_");
+                let tmp_layer_name = format!(".layer_{}.tmp", &clean_digest[..clean_digest.len().min(16)]);
+                let tmp_layer_path = cache_dir.join(&tmp_layer_name);
+
+                let mut tmp_file = tokio::fs::File::create(&tmp_layer_path).await?;
+                while let Some(chunk) = blob_res.chunk().await? {
+                    tmp_file.write_all(&chunk).await?;
+                }
+                tmp_file.flush().await?;
+                drop(tmp_file);
+
+                // Extract the tar.gz stream directly from disk file
+                let file = std::fs::File::open(&tmp_layer_path)?;
+                let extract_res = extract_layer_stream(file, &cache_dir, &mut master_file_map);
+                let _ = std::fs::remove_file(&tmp_layer_path);
+                extract_res?;
             }
         }
 
@@ -995,7 +1044,7 @@ impl OciExtractor {
         }
 
         tracing::info!("All images extracted and merged! Compressing merged rootfs...");
-        compress_to_tar_xz(&cache_dir, target_path, &master_file_map)?;
+        compress_and_cleanup(cache_dir, target_path.to_path_buf(), master_file_map).await?;
 
         Ok(UpdateStatus::Recreated)
     }
@@ -1136,6 +1185,37 @@ fn extract_layer_stream<R: Read>(
     Ok(())
 }
 
+/// Scans a cache directory and prunes any orphaned temporary layer files (.layer_*.tmp)
+/// or unpacked cache directories (*.cache) older than max_age_secs.
+pub fn prune_stale_cache_files(cache_dir: &Path, max_age_secs: u64) {
+    if !cache_dir.exists() {
+        return;
+    }
+    let now = std::time::SystemTime::now();
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if (name.starts_with(".layer_") && name.ends_with(".tmp")) || name.ends_with(".cache") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age.as_secs() >= max_age_secs {
+                                tracing::info!("Pruning stale cache artifact: {}", path.display());
+                                if meta.is_dir() {
+                                    let _ = fs::remove_dir_all(&path);
+                                } else {
+                                    let _ = fs::remove_file(&path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ==============================================================================
 // Unit Tests
 // ==============================================================================
@@ -1247,6 +1327,69 @@ mod tests {
         // Verify fallback /sbin/init was generated
         assert!(file_map.contains_key("sbin/init"));
         assert!(temp_dir.join("sbin/init").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_prune_stale_cache_files() {
+        let temp_dir = std::env::temp_dir().join(format!("hostable_prune_test_{}", rand::random::<u32>()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let dummy_tmp = temp_dir.join(".layer_abcdef12.tmp");
+        fs::write(&dummy_tmp, b"dummy layer data").unwrap();
+
+        let dummy_cache_dir = temp_dir.join("test_container.tar.xz.cache");
+        fs::create_dir_all(&dummy_cache_dir).unwrap();
+        fs::write(dummy_cache_dir.join("some_file"), b"cache").unwrap();
+
+        let keep_file = temp_dir.join("keep_me.txt");
+        fs::write(&keep_file, b"keep this").unwrap();
+
+        assert!(dummy_tmp.exists());
+        assert!(dummy_cache_dir.exists());
+        assert!(keep_file.exists());
+
+        // Run pruning with max_age_secs = 0 (prunes all matching cache files)
+        prune_stale_cache_files(&temp_dir, 0);
+
+        assert!(!dummy_tmp.exists(), "Temporary layer file should have been pruned");
+        assert!(!dummy_cache_dir.exists(), "Cache directory should have been pruned");
+        assert!(keep_file.exists(), "Non-cache file must remain intact");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_compress_and_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("hostable_comp_test_{}", rand::random::<u32>()));
+        let cache_dir = temp_dir.join("rootfs.cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let hello_file = cache_dir.join("hello.txt");
+        fs::write(&hello_file, b"Hello Hostable World").unwrap();
+
+        let out_tar_xz = temp_dir.join("rootfs.tar.xz");
+        let mut file_map = HashMap::new();
+        file_map.insert(
+            "hello.txt".to_string(),
+            PosixMetadata {
+                entry_type: b'0',
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                size: 20,
+                mtime: 1000,
+                link_name: None,
+            },
+        );
+
+        compress_and_cleanup(cache_dir.clone(), out_tar_xz.clone(), file_map)
+            .await
+            .unwrap();
+
+        assert!(out_tar_xz.exists(), "Output tar.xz must exist");
+        assert!(!cache_dir.exists(), "Unpacked cache directory must be cleaned up");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
