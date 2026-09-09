@@ -53,6 +53,10 @@ pub struct AnsibleDeployParams {
     pub secureweb_domain: Option<String>,
     #[serde(default = "default_port")]
     pub app_port: Option<u16>,
+    #[serde(default)]
+    pub default_network: Option<String>,
+    #[serde(default)]
+    pub target_subnet: Option<String>,
 }
 
 fn default_cores() -> u32 {
@@ -293,7 +297,8 @@ pub async fn execute_deployment(
         "expose_secureweb": params.expose_secureweb,
         "secureweb_url": secureweb_gateway_url,
         "secureweb_domain": params.secureweb_domain.clone().unwrap_or_default(),
-        "app_port": params.app_port.unwrap_or(80)
+        "app_port": params.app_port.unwrap_or(80),
+        "target_network": params.default_network.clone().unwrap_or_else(|| "eth0".to_string())
     });
 
     let playbook_path = PathBuf::from("ansible/playbooks/deploy_lxc.yml");
@@ -481,7 +486,69 @@ pub async fn execute_deployment(
         }
     }
 
-    // 4. SecureWeb Gateway Registration (if enabled)
+    // 4. IP Discovery & SecureWeb Gateway Registration
+    let target_iface = params
+        .default_network
+        .clone()
+        .unwrap_or_else(|| std::env::var("HOSTABLE_DEFAULT_NETWORK").unwrap_or_else(|_| "eth0".to_string()));
+
+    engine
+        .emit_event(
+            &task_id,
+            "task",
+            "NET_DISCOVERY",
+            &format!(
+                "Polling container network lease on interface '{}'...",
+                target_iface
+            ),
+        )
+        .await;
+
+    let discovered_ip = match state
+        .proxmox
+        .poll_lxc_ip(
+            &node,
+            params.vmid,
+            Some(&target_iface),
+            params.target_subnet.as_deref(),
+            25,
+        )
+        .await
+    {
+        Ok(ip) => {
+            engine
+                .emit_event(
+                    &task_id,
+                    "ok",
+                    "NET_DISCOVERY",
+                    &format!("Assigned IP discovered: {} on '{}'", ip, target_iface),
+                )
+                .await;
+            ip
+        }
+        Err(err) => {
+            let fallback_ip = if params.ip_address != "dhcp" && !params.ip_address.is_empty() {
+                params
+                    .ip_address
+                    .split('/')
+                    .next()
+                    .unwrap_or(&params.ip_address)
+                    .to_string()
+            } else {
+                format!("10.0.1.{}", params.vmid)
+            };
+            engine
+                .emit_event(
+                    &task_id,
+                    "warn",
+                    "NET_DISCOVERY",
+                    &format!("{} - using fallback IP {}", err, fallback_ip),
+                )
+                .await;
+            fallback_ip
+        }
+    };
+
     if params.expose_secureweb {
         if let Some(domain) = &params.secureweb_domain {
             engine
@@ -490,15 +557,17 @@ pub async fn execute_deployment(
                     "task",
                     "SECUREWEB_LINK",
                     &format!(
-                        "Registering upstream domain '{}' with SecureWeb Gateway...",
-                        domain
+                        "Registering upstream domain '{}' -> {}:{} with SecureWeb Gateway...",
+                        domain,
+                        discovered_ip,
+                        params.app_port.unwrap_or(80)
                     ),
                 )
                 .await;
 
             let route = crate::secureweb::SecureWebRoute {
                 domain: domain.clone(),
-                target_ip: format!("10.0.1.{}", params.vmid), // Or discovered container IP
+                target_ip: discovered_ip,
                 target_port: params.app_port.unwrap_or(80),
                 service_name: params.hostname.clone(),
                 vmid: params.vmid,

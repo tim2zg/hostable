@@ -18,6 +18,7 @@
   let selectedStorage = 'local-zfs';
   let networkBridges: string[] = ['vmbr0'];
   let selectedBridge = 'vmbr0';
+  let defaultNetworkIface = 'eth0';
   let ipMode: 'dhcp' | 'static' = 'dhcp';
   let staticIp = '';
   let gateway = '';
@@ -49,6 +50,12 @@
     }
 
     try {
+      const netRes = await apiGet('/node/default-network');
+      if (netRes?.default_interface) defaultNetworkIface = netRes.default_interface;
+      if (netRes?.default_bridge) selectedBridge = netRes.default_bridge;
+    } catch (e) {}
+
+    try {
       const storagesRes = await apiGet('/node/storages');
       if (storagesRes?.data && Array.isArray(storagesRes.data)) {
         const poolNames = storagesRes.data
@@ -65,7 +72,9 @@
       const bridgesRes = await apiGet('/node/bridges');
       if (Array.isArray(bridgesRes) && bridgesRes.length > 0) {
         networkBridges = bridgesRes;
-        selectedBridge = bridgesRes[0];
+        if (!networkBridges.includes(selectedBridge)) {
+          selectedBridge = bridgesRes[0];
+        }
       }
     } catch (e) {}
   });
@@ -122,6 +131,7 @@
       disk_size: `${diskGb}G`,
       storage_pool: selectedStorage,
       net_bridge: selectedBridge,
+      default_network: defaultNetworkIface.trim(),
       ip_address: ipMode === 'dhcp' ? 'dhcp' : staticIp,
       gateway: ipMode === 'static' && gateway ? gateway : null,
       mountpoints: mountpoints.filter(m => m.host && m.container),
@@ -286,6 +296,15 @@
               <option value={bridge}>{bridge}</option>
             {/each}
           </select>
+        </div>
+        <div class="form-group">
+          <label for="input-iface">Default Network Interface</label>
+          <input
+            id="input-iface"
+            type="text"
+            placeholder="eth0"
+            bind:value={defaultNetworkIface}
+          />
         </div>
       </div>
     </div>

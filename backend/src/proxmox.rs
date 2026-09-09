@@ -500,4 +500,85 @@ impl ProxmoxClient {
         }
         Ok(max_id + 1)
     }
+
+    pub async fn get_lxc_interfaces(
+        &self,
+        node: &str,
+        vmid: u32,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{}/nodes/{}/lxc/{}/interfaces", self.base_url, node, vmid);
+        tracing::info!("GET {}", url);
+        let res = self
+            .client
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        Self::handle_response(&url, res).await
+    }
+
+    pub async fn poll_lxc_ip(
+        &self,
+        node: &str,
+        vmid: u32,
+        preferred_iface: Option<&str>,
+        preferred_subnet: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let target_iface = preferred_iface.unwrap_or("eth0");
+        let start = std::time::Instant::now();
+        let max_duration = std::time::Duration::from_secs(timeout_secs);
+
+        while start.elapsed() < max_duration {
+            if let Ok(res) = self.get_lxc_interfaces(node, vmid).await {
+                if let Some(data) = res["data"].as_array() {
+                    let mut fallback_ip: Option<String> = None;
+
+                    for item in data {
+                        let name = item["name"].as_str().unwrap_or("");
+                        if name == "lo" {
+                            continue;
+                        }
+
+                        if let Some(inet) = item["inet"].as_str() {
+                            let ip = inet.split('/').next().unwrap_or(inet).trim();
+                            if !ip.is_empty() && !ip.starts_with("127.") {
+                                if name == target_iface {
+                                    if let Some(subnet) = preferred_subnet {
+                                        if ip.starts_with(subnet) {
+                                            return Ok(ip.to_string());
+                                        }
+                                    } else {
+                                        return Ok(ip.to_string());
+                                    }
+                                }
+
+                                if let Some(subnet) = preferred_subnet {
+                                    if ip.starts_with(subnet) {
+                                        return Ok(ip.to_string());
+                                    }
+                                }
+
+                                if fallback_ip.is_none() {
+                                    fallback_ip = Some(ip.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ip) = fallback_ip {
+                        return Ok(ip);
+                    }
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        }
+
+        Err(format!(
+            "Timed out after {}s waiting for IP lease on interface '{}' for LXC {}",
+            timeout_secs, target_iface, vmid
+        ))
+    }
 }

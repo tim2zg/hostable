@@ -25,29 +25,23 @@ cat > /etc/hostable/.env << EOF
 PROXMOX_HOST="$pve_host"
 PROXMOX_TOKEN_ID="$token_id"
 PROXMOX_TOKEN_SECRET="$token_secret"
+PORT="3000"
+HOSTABLE_DEFAULT_NETWORK="eth0"
+DATABASE_URL="sqlite:///etc/hostable/hostable.db?mode=rwc"
 EOF
-
-if [ ! -f /etc/hostable/config.yaml ]; then
-cat > /etc/hostable/config.yaml << 'EOF'
-interval_seconds: 3600
-deployments:
-  - image: alpine:latest
-    vmid: 103
-EOF
-fi
 
 # Detect init system
 if command -v systemctl &> /dev/null && [ -d /run/systemd/system ]; then
     echo "Detected systemd. Setting up service..."
     cat > /etc/systemd/system/hostable.service << 'EOF'
 [Unit]
-Description=Hostable Daemon
+Description=Hostable Platform Manager
 After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/hostable/.env
-ExecStart=/usr/local/bin/hostable manage --config /etc/hostable/config.yaml
+ExecStart=/usr/local/bin/hostable start
 Restart=always
 RestartSec=5
 
@@ -58,29 +52,33 @@ EOF
     systemctl enable --now hostable
 elif command -v openrc-run &> /dev/null; then
     echo "Detected OpenRC. Setting up service..."
-    cat > /etc/conf.d/hostable << EOF
-export PROXMOX_HOST="$pve_host"
-export PROXMOX_TOKEN_ID="$token_id"
-export PROXMOX_TOKEN_SECRET="$token_secret"
-EOF
-
     cat > /etc/init.d/hostable << 'EOF'
 #!/sbin/openrc-run
-description="Hostable Daemon"
+description="Hostable Platform Manager"
 command="/usr/local/bin/hostable"
-command_args="manage --config /etc/hostable/config.yaml"
+command_args="start"
 command_background="yes"
 pidfile="/run/hostable.pid"
 directory="/etc/hostable"
+
+depend() {
+    need net
+    after firewall
+}
 EOF
     chmod +x /etc/init.d/hostable
     rc-update add hostable default
-    rc-service hostable start
+    rc-service hostable restart
 else
     echo "Warning: Neither systemd nor OpenRC detected."
-    echo "You can run the daemon manually in the background:"
-    echo "source /etc/hostable/.env && hostable manage --config /etc/hostable/config.yaml &"
+    echo "You can run the platform manually:"
+    echo "source /etc/hostable/.env && hostable start &"
 fi
 
-echo "Setup complete! Hostable is installed in this container."
-echo "You can edit your deployments at /etc/hostable/config.yaml"
+echo ""
+echo "==============================================================="
+echo "🎉 HOSTABLE INSTALLED IN CONTAINER!"
+echo "==============================================================="
+echo "🌐 Access Web Dashboard: http://<container-ip>:3000"
+echo "📁 Database: Embedded SQLite (/etc/hostable/hostable.db)"
+echo "==============================================================="

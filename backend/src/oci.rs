@@ -193,6 +193,209 @@ fn compress_to_tar_xz(
     Ok(())
 }
 
+fn add_injected_file(
+    cache_dir: &Path,
+    rel_path: &str,
+    content: &[u8],
+    mode: u32,
+    file_map: &mut HashMap<String, PosixMetadata>,
+) {
+    let clean_rel = rel_path.trim_start_matches('/');
+    let full_path = cache_dir.join(clean_rel);
+    if let Some(parent) = full_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(_) = fs::write(&full_path, content) {
+        let meta = PosixMetadata {
+            entry_type: b'0',
+            mode,
+            uid: 0,
+            gid: 0,
+            size: content.len() as u64,
+            mtime: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            link_name: None,
+        };
+        file_map.insert(clean_rel.to_string(), meta);
+    }
+}
+
+fn add_injected_symlink(
+    rel_path: &str,
+    target: &str,
+    file_map: &mut HashMap<String, PosixMetadata>,
+) {
+    let clean_rel = rel_path.trim_start_matches('/');
+    let meta = PosixMetadata {
+        entry_type: b'2', // symlink
+        mode: 0o777,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        mtime: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        link_name: Some(target.to_string()),
+    };
+    file_map.insert(clean_rel.to_string(), meta);
+}
+
+fn inject_init_and_entrypoint_services(
+    cache_dir: &Path,
+    image_config: Option<&ConfigContainer>,
+    env_vars: Option<&[String]>,
+    extra_files: Option<&HashMap<String, String>>,
+    file_map: &mut HashMap<String, PosixMetadata>,
+) {
+    // 1. Injected environment variables
+    let mut combined_envs: Vec<String> = Vec::new();
+    if let Some(cfg) = image_config {
+        for e in &cfg.env {
+            if !e.trim().is_empty() {
+                combined_envs.push(e.clone());
+            }
+        }
+    }
+    if let Some(envs) = env_vars {
+        for e in envs {
+            if !e.trim().is_empty() {
+                combined_envs.push(e.clone());
+            }
+        }
+    }
+
+    if !combined_envs.is_empty() {
+        let mut env_script = String::from("#!/bin/sh\n# Hostable Injected Environment Variables\n");
+        for e in &combined_envs {
+            env_script.push_str(&format!("export {}\n", e));
+        }
+        add_injected_file(
+            cache_dir,
+            "etc/profile.d/hostable-env.sh",
+            env_script.as_bytes(),
+            0o755,
+            file_map,
+        );
+    }
+
+    // 2. Determine command & working dir
+    let workdir = image_config
+        .map(|c| c.working_dir.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
+
+    let mut cmd_parts: Vec<String> = Vec::new();
+    if let Some(cfg) = image_config {
+        if let Some(entry) = &cfg.entrypoint {
+            for e in entry {
+                if !e.trim().is_empty() {
+                    cmd_parts.push(e.clone());
+                }
+            }
+        }
+        if let Some(cmd) = &cfg.cmd {
+            for c in cmd {
+                if !c.trim().is_empty() {
+                    cmd_parts.push(c.clone());
+                }
+            }
+        }
+    }
+
+    let exec_cmd = if !cmd_parts.is_empty() {
+        cmd_parts
+            .iter()
+            .map(|p| {
+                if p.contains(' ') || p.contains('"') || p.contains('$') {
+                    format!("\"{}\"", p.replace('"', "\\\""))
+                } else {
+                    p.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        String::from("/bin/sh")
+    };
+
+    // 3. Write hostable-entrypoint.sh wrapper script
+    let entrypoint_script = format!(
+        "#!/bin/sh\n# Hostable PID 1 Init Wrapper\n[ -f /etc/profile.d/hostable-env.sh ] && . /etc/profile.d/hostable-env.sh\ncd \"{}\"\nexec {} \"$@\"\n",
+        workdir, exec_cmd
+    );
+    add_injected_file(
+        cache_dir,
+        "usr/local/bin/hostable-entrypoint.sh",
+        entrypoint_script.as_bytes(),
+        0o755,
+        file_map,
+    );
+
+    // 4. Write systemd service file & enable symlink
+    let systemd_service = format!(
+        "[Unit]\nDescription=Hostable OCI Application Container Service\nAfter=network.target network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironmentFile=-/etc/profile.d/hostable-env.sh\nExecStart=/usr/local/bin/hostable-entrypoint.sh\nRestart=always\nRestartSec=3\nKillMode=mixed\n\n[Install]\nWantedBy=multi-user.target\n",
+        workdir
+    );
+    add_injected_file(
+        cache_dir,
+        "etc/systemd/system/hostable-app.service",
+        systemd_service.as_bytes(),
+        0o644,
+        file_map,
+    );
+    add_injected_symlink(
+        "etc/systemd/system/multi-user.target.wants/hostable-app.service",
+        "/etc/systemd/system/hostable-app.service",
+        file_map,
+    );
+
+    // 5. Write OpenRC init service & default runlevel symlink
+    let openrc_service = format!(
+        "#!/sbin/openrc-run\ndescription=\"Hostable OCI Application Container Service\"\ncommand=\"/usr/local/bin/hostable-entrypoint.sh\"\ncommand_background=\"true\"\npidfile=\"/run/hostable-app.pid\"\ndirectory=\"{}\"\n\ndepend() {{\n    need net\n    after firewall\n}}\n",
+        workdir
+    );
+    add_injected_file(
+        cache_dir,
+        "etc/init.d/hostable-app",
+        openrc_service.as_bytes(),
+        0o755,
+        file_map,
+    );
+    add_injected_symlink(
+        "etc/runlevels/default/hostable-app",
+        "/etc/init.d/hostable-app",
+        file_map,
+    );
+
+    // 6. Fallback PID 1 init script if no init binary exists
+    if !file_map.contains_key("sbin/init") && !file_map.contains_key("bin/init") {
+        let fallback_init = "#!/bin/sh\n# Hostable Minimal PID 1 Init\nexec /usr/local/bin/hostable-entrypoint.sh\n";
+        add_injected_file(
+            cache_dir,
+            "sbin/init",
+            fallback_init.as_bytes(),
+            0o755,
+            file_map,
+        );
+    }
+
+    // 7. Inject any user extra files
+    if let Some(files) = extra_files {
+        for (rel, content) in files {
+            add_injected_file(
+                cache_dir,
+                rel,
+                content.as_bytes(),
+                0o644,
+                file_map,
+            );
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum UpdateStatus {
     Unchanged,
@@ -380,6 +583,20 @@ impl OciExtractor {
             }
         };
 
+        // Fetch image config blob to inspect ENTRYPOINT, CMD, WORKINGDIR, ENV
+        let config_url = format!(
+            "https://{}/v2/{}/blobs/{}",
+            img.registry, img.repository, manifest.config.digest
+        );
+        let mut image_config: Option<ConfigContainer> = None;
+        if let Ok(c_res) = self.client.get(&config_url).headers(headers.clone()).send().await {
+            if c_res.status().is_success() {
+                if let Ok(blob) = c_res.json::<ImageConfigBlob>().await {
+                    image_config = Some(blob.config);
+                }
+            }
+        }
+
         let new_layers: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
         tracing::info!(
             "Found {} layers in resolved image manifest.",
@@ -426,55 +643,13 @@ impl OciExtractor {
             tracing::info!("Image hasn't changed. Using existing cache...");
             if !target_path.exists() {
                 tracing::info!("Compressing rootfs to {}...", target_path.display());
-
-                if let Some(envs) = env_vars {
-                    if !envs.is_empty() {
-                        let profile_dir = cache_dir.join("etc").join("profile.d");
-                        let _ = fs::create_dir_all(&profile_dir);
-                        let mut content = String::from("#!/bin/sh\n");
-                        for e in envs {
-                            content.push_str(&format!("export {}\n", e));
-                        }
-                        let _ = fs::write(profile_dir.join("hostable-env.sh"), &content);
-                        let meta = PosixMetadata {
-                            entry_type: b'0',
-                            mode: 0o755,
-                            uid: 0,
-                            gid: 0,
-                            size: content.len() as u64,
-                            mtime: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            link_name: None,
-                        };
-                        file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
-                    }
-                }
-
-                if let Some(files) = &extra_files {
-                    for (path_str, content) in files {
-                        let full_path = cache_dir.join(path_str);
-                        if let Some(p) = full_path.parent() {
-                            let _ = fs::create_dir_all(p);
-                        }
-                        let _ = fs::write(&full_path, content);
-                        let meta = PosixMetadata {
-                            entry_type: b'0',
-                            mode: 0o755,
-                            uid: 0,
-                            gid: 0,
-                            size: content.len() as u64,
-                            mtime: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            link_name: None,
-                        };
-                        file_map.insert(path_str.trim_start_matches('/').to_string(), meta);
-                    }
-                }
-
+                inject_init_and_entrypoint_services(
+                    &cache_dir,
+                    image_config.as_ref(),
+                    env_vars,
+                    extra_files.as_ref(),
+                    &mut file_map,
+                );
                 compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
             }
             return Ok(UpdateStatus::Unchanged);
@@ -541,53 +716,13 @@ impl OciExtractor {
             target_path.display()
         );
 
-        if let Some(envs) = env_vars {
-            if !envs.is_empty() {
-                let profile_dir = cache_dir.join("etc").join("profile.d");
-                let _ = fs::create_dir_all(&profile_dir);
-                let mut content = String::from("#!/bin/sh\n");
-                for e in envs {
-                    content.push_str(&format!("export {}\n", e));
-                }
-                let _ = fs::write(profile_dir.join("hostable-env.sh"), &content);
-                let meta = PosixMetadata {
-                    entry_type: b'0',
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    size: content.len() as u64,
-                    mtime: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    link_name: None,
-                };
-                file_map.insert("etc/profile.d/hostable-env.sh".to_string(), meta);
-            }
-        }
-
-        if let Some(files) = &extra_files {
-            for (path_str, content) in files {
-                let full_path = cache_dir.join(path_str);
-                if let Some(p) = full_path.parent() {
-                    let _ = fs::create_dir_all(p);
-                }
-                let _ = fs::write(&full_path, content);
-                let meta = PosixMetadata {
-                    entry_type: b'0',
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    size: content.len() as u64,
-                    mtime: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    link_name: None,
-                };
-                file_map.insert(path_str.trim_start_matches('/').to_string(), meta);
-            }
-        }
+        inject_init_and_entrypoint_services(
+            &cache_dir,
+            image_config.as_ref(),
+            env_vars,
+            extra_files.as_ref(),
+            &mut file_map,
+        );
 
         compress_to_tar_xz(&cache_dir, target_path, &file_map)?;
 
@@ -1070,5 +1205,49 @@ mod tests {
 
         // Cleanup temp folder
         let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn test_inject_init_and_entrypoint_services() {
+        let temp_dir = std::env::temp_dir().join(format!("hostable_init_test_{}", rand::random::<u32>()));
+        let mut file_map = HashMap::new();
+
+        let cfg = ConfigContainer {
+            env: vec!["APP_PORT=8080".to_string()],
+            cmd: Some(vec!["-g".to_string(), "daemon off;".to_string()]),
+            entrypoint: Some(vec!["/docker-entrypoint.sh".to_string()]),
+            working_dir: "/app".to_string(),
+        };
+
+        inject_init_and_entrypoint_services(
+            &temp_dir,
+            Some(&cfg),
+            Some(&["CUSTOM_KEY=custom_value".to_string()]),
+            None,
+            &mut file_map,
+        );
+
+        // Verify entrypoint script was generated
+        assert!(file_map.contains_key("usr/local/bin/hostable-entrypoint.sh"));
+        assert!(temp_dir.join("usr/local/bin/hostable-entrypoint.sh").exists());
+        let script = fs::read_to_string(temp_dir.join("usr/local/bin/hostable-entrypoint.sh")).unwrap();
+        assert!(script.contains("cd \"/app\""));
+        assert!(script.contains("/docker-entrypoint.sh"));
+
+        // Verify systemd service and symlink was generated
+        assert!(file_map.contains_key("etc/systemd/system/hostable-app.service"));
+        assert!(file_map.contains_key("etc/systemd/system/multi-user.target.wants/hostable-app.service"));
+        assert!(temp_dir.join("etc/systemd/system/hostable-app.service").exists());
+
+        // Verify openrc service and symlink was generated
+        assert!(file_map.contains_key("etc/init.d/hostable-app"));
+        assert!(file_map.contains_key("etc/runlevels/default/hostable-app"));
+        assert!(temp_dir.join("etc/init.d/hostable-app").exists());
+
+        // Verify fallback /sbin/init was generated
+        assert!(file_map.contains_key("sbin/init"));
+        assert!(temp_dir.join("sbin/init").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

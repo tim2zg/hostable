@@ -5,6 +5,7 @@
 # Hostable cache and temporary files
 **/.cache.meta
 **/*.tar.xz
+**/*.cache/
 hostable-linux-amd64
 build.bat
 

@@ -7,11 +7,9 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use clap::{Parser, Subcommand};
-use rand::distr::{Alphanumeric, SampleString};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -23,6 +21,7 @@ use tracing_subscriber;
 
 pub mod ansible;
 mod converter;
+pub mod db;
 mod oci;
 mod proxmox;
 mod routes;
@@ -34,7 +33,7 @@ struct Assets;
 
 pub struct AppState {
     pub proxmox: proxmox::ProxmoxClient,
-    pub pool: Option<sqlx::PgPool>,
+    pub db: Option<Arc<db::DbBackend>>,
     pub catalog_cache: tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>,
     pub default_node: String,
     pub ansible: Arc<ansible::AnsibleEngine>,
@@ -103,56 +102,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.command {
         Commands::Start => {
-            let database_url = env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/hostable".to_string());
+            let database_url = env::var("DATABASE_URL").ok();
+            let db_res = db::DbBackend::init(database_url).await;
 
-            tracing::info!("Connecting to database...");
-            let _pool = PgPoolOptions::new()
-                .max_connections(5)
-                .connect(&database_url)
-                .await
-                .ok();
-
-            if let Some(pool) = &_pool {
-                tracing::info!("Running database migrations...");
-                if let Err(e) = sqlx::migrate!().run(pool).await {
-                    tracing::error!("Failed to run migrations: {}", e);
+            let db_backend = match db_res {
+                Ok((backend, token)) => {
+                    println!("\n=======================================================");
+                    println!("🚀 HOSTABLE INITIALIZED! [{}]", backend.engine_name());
+                    println!("🔐 Your Admin API Token is: {}", token);
+                    println!("Please save this token. You will need it to log in.");
+                    println!("=======================================================\n");
+                    Some(Arc::new(backend))
                 }
-
-                let count: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or((0,));
-
-                if count.0 == 0 {
-                    let token = Alphanumeric.sample_string(&mut rand::rng(), 32);
-                    let token_str = format!("hst_{}", token);
-
-                    sqlx::query("INSERT INTO users (username, api_token) VALUES ($1, $2)")
-                        .bind("admin")
-                        .bind(&token_str)
-                        .execute(pool)
-                        .await
-                        .unwrap();
+                Err(err) => {
+                    tracing::warn!("Database init note: {}. Running in mock mode.", err);
+                    println!("\n=======================================================");
+                    println!("🚀 HOSTABLE INITIALIZED IN MOCK MODE!");
+                    println!("🔐 Your Mock API Token is: hostable_mock_token");
+                    println!("=======================================================\n");
+                    None
                 }
-
-                let row: (String,) =
-                    sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(("unknown_token".to_string(),));
-
-                println!("\n=======================================================");
-                println!("🚀 HOSTABLE INITIALIZED!");
-                println!("🔐 Your Admin API Token is: {}", row.0);
-                println!("Please save this token. You will need it to log in.");
-                println!("=======================================================\n");
-            } else {
-                println!("\n=======================================================");
-                println!("🚀 HOSTABLE INITIALIZED IN MOCK MODE!");
-                println!("🔐 Your Mock API Token is: hostable_mock_token");
-                println!("=======================================================\n");
-            }
+            };
 
             let proxmox_client = proxmox::ProxmoxClient::new();
             let default_node = proxmox_client.get_default_node().await;
@@ -161,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let shared_state = Arc::new(AppState {
                 proxmox: proxmox_client,
-                pool: _pool,
+                db: db_backend,
                 catalog_cache: tokio::sync::RwLock::new(None),
                 default_node,
                 ansible: ansible_engine,
@@ -219,6 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/api/node/storages", get(get_storages_handler))
                 .route("/api/node/bridges", get(get_bridges_handler))
                 .route("/api/node/next-vmid", get(get_next_vmid_handler))
+                .route(
+                    "/api/node/default-network",
+                    get(get_default_network_handler),
+                )
                 .route("/api/ansible/deploy", post(ansible::trigger_deploy_handler))
                 .route(
                     "/api/ansible/tasks/{task_id}/events",
@@ -471,6 +445,19 @@ pub async fn get_next_vmid_handler(
     }
 }
 
+pub async fn get_default_network_handler(
+    _auth: RequireAuth,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let iface = env::var("HOSTABLE_DEFAULT_NETWORK").unwrap_or_else(|_| "eth0".to_string());
+    let bridge = env::var("HOSTABLE_DEFAULT_BRIDGE").unwrap_or_else(|_| "vmbr0".to_string());
+    let subnet = env::var("HOSTABLE_DEFAULT_SUBNET").ok();
+    Ok(Json(json!({
+        "default_interface": iface,
+        "default_bridge": bridge,
+        "default_subnet": subnet
+    })))
+}
+
 async fn static_handler(uri: axum::http::Uri) -> axum::response::Response {
     let mut path = uri.path().trim_start_matches('/').to_string();
 
@@ -620,15 +607,14 @@ where
             ));
         };
 
-        if let Some(pool) = &app_state.pool {
-            let user = sqlx::query("SELECT id FROM users WHERE api_token = $1")
-                .bind(token)
-                .fetch_optional(pool)
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database error"))?;
-
-            if user.is_some() {
-                return Ok(RequireAuth);
+        if let Some(db) = &app_state.db {
+            match db.verify_token(token).await {
+                Ok(valid) if valid => return Ok(RequireAuth),
+                Ok(_) => return Err((StatusCode::UNAUTHORIZED, "Invalid API token")),
+                Err(e) => {
+                    tracing::error!("Database authentication error: {}", e);
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error"));
+                }
             }
         } else {
             if token == "hostable_mock_token" {

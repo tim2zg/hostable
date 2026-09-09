@@ -50,13 +50,9 @@ pub async fn deploy_lxc_endpoint(
     let mut final_envs = payload.env_vars.clone();
     if payload.use_hostable_db {
         if let Some(db_name) = &payload.db_name {
-            if let Some(pool) = &state.pool {
-                // Warning: In production, sanitize this db_name
+            if let Some(db) = &state.db {
                 let safe_db = db_name.replace("\"", "").replace("'", "");
-                let q = format!("CREATE DATABASE \"{}\"", safe_db);
-                if let Err(e) = sqlx::query(&q).execute(pool).await {
-                    println!("Failed to create DB (might exist): {}", e);
-                }
+                let _ = db.create_database(&safe_db).await;
 
                 if let Ok(ip) = local_ip_address::local_ip() {
                     // For now, assuming hostable connects as admin user, we will just pass the admin credentials or a dedicated user
