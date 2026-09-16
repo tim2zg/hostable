@@ -91,6 +91,13 @@ impl DbBackend {
         }
     }
 
+    pub fn hash_token(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     async fn ensure_admin_token_pg(pool: &Pool<Postgres>) -> Result<String, String> {
         let existing: Option<(String,)> =
             sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
@@ -98,19 +105,29 @@ impl DbBackend {
                 .await
                 .map_err(|e| e.to_string())?;
 
-        if let Some((token,)) = existing {
-            return Ok(token);
+        if let Some((stored,)) = existing {
+            // If stored token is in plaintext legacy format (starts with hst_), migrate to hash
+            if stored.starts_with("hst_") {
+                let hashed = Self::hash_token(&stored);
+                let _ = sqlx::query("UPDATE users SET api_token = $1 WHERE username = 'admin'")
+                    .bind(&hashed)
+                    .execute(pool)
+                    .await;
+                return Ok(stored);
+            }
+            return Ok("[hashed token configured in database]".to_string());
         }
 
-        let token = format!("hst_{}", Alphanumeric.sample_string(&mut rand::rng(), 32));
+        let raw_token = format!("hst_{}", Alphanumeric.sample_string(&mut rand::rng(), 32));
+        let hashed_token = Self::hash_token(&raw_token);
         sqlx::query("INSERT INTO users (username, api_token) VALUES ($1, $2)")
             .bind("admin")
-            .bind(&token)
+            .bind(&hashed_token)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(token)
+        Ok(raw_token)
     }
 
     async fn ensure_admin_token_sqlite(pool: &Pool<Sqlite>) -> Result<String, String> {
@@ -120,40 +137,77 @@ impl DbBackend {
                 .await
                 .map_err(|e| e.to_string())?;
 
-        if let Some((token,)) = existing {
-            return Ok(token);
+        if let Some((stored,)) = existing {
+            if stored.starts_with("hst_") {
+                let hashed = Self::hash_token(&stored);
+                let _ = sqlx::query("UPDATE users SET api_token = ? WHERE username = 'admin'")
+                    .bind(&hashed)
+                    .execute(pool)
+                    .await;
+                return Ok(stored);
+            }
+            return Ok("[hashed token configured in database]".to_string());
         }
 
-        let token = format!("hst_{}", Alphanumeric.sample_string(&mut rand::rng(), 32));
+        let raw_token = format!("hst_{}", Alphanumeric.sample_string(&mut rand::rng(), 32));
+        let hashed_token = Self::hash_token(&raw_token);
         sqlx::query("INSERT INTO users (username, api_token) VALUES (?, ?)")
             .bind("admin")
-            .bind(&token)
+            .bind(&hashed_token)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(token)
+        Ok(raw_token)
     }
 
-    pub async fn verify_token(&self, token: &str) -> Result<bool, String> {
+    pub async fn verify_token(&self, raw_token: &str) -> Result<bool, String> {
+        let hashed = Self::hash_token(raw_token);
         match self {
             DbBackend::Postgres(pool) => {
-                let user: Option<(i32,)> =
-                    sqlx::query_as("SELECT id FROM users WHERE api_token = $1")
-                        .bind(token)
+                let user: Option<(i32, String)> =
+                    sqlx::query_as("SELECT id, api_token FROM users WHERE api_token = $1 OR api_token = $2")
+                        .bind(&hashed)
+                        .bind(raw_token)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| e.to_string())?;
-                Ok(user.is_some())
+
+                if let Some((id, stored)) = user {
+                    if stored == raw_token {
+                        // In-place migration of legacy token to SHA-256 hash
+                        let _ = sqlx::query("UPDATE users SET api_token = $1 WHERE id = $2")
+                            .bind(&hashed)
+                            .bind(id)
+                            .execute(pool)
+                            .await;
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
             DbBackend::Sqlite(pool) => {
-                let user: Option<(i64,)> =
-                    sqlx::query_as("SELECT id FROM users WHERE api_token = ?")
-                        .bind(token)
+                let user: Option<(i64, String)> =
+                    sqlx::query_as("SELECT id, api_token FROM users WHERE api_token = ? OR api_token = ?")
+                        .bind(&hashed)
+                        .bind(raw_token)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| e.to_string())?;
-                Ok(user.is_some())
+
+                if let Some((id, stored)) = user {
+                    if stored == raw_token {
+                        let _ = sqlx::query("UPDATE users SET api_token = ? WHERE id = ?")
+                            .bind(&hashed)
+                            .bind(id)
+                            .execute(pool)
+                            .await;
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
@@ -194,11 +248,63 @@ mod tests {
         assert_eq!(backend.engine_name(), "Embedded SQLite");
         assert!(token.starts_with("hst_"));
 
+        // Verify the token stored in database is hashed, NOT plaintext
+        if let DbBackend::Sqlite(pool) = &backend {
+            let (stored_token,): (String,) = sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
+                .fetch_one(pool)
+                .await
+                .expect("fetch stored token failed");
+            assert_ne!(stored_token, token, "Stored token must not be plaintext");
+            assert_eq!(stored_token, DbBackend::hash_token(&token), "Stored token must match SHA-256 hash");
+        }
+
         let valid = backend.verify_token(&token).await.expect("verify failed");
         assert!(valid);
 
         let invalid = backend.verify_token("wrong_token").await.expect("verify failed");
         assert!(!invalid);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_token_migration() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("test_hostable_legacy_{}.db", rand::random::<u32>()));
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&db_url)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, api_token TEXT NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_token = "hst_legacy_plaintext_token_123456";
+        sqlx::query("INSERT INTO users (username, api_token) VALUES (?, ?)")
+            .bind("legacy_user")
+            .bind(legacy_token)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let backend = DbBackend::Sqlite(pool.clone());
+
+        // Verification must succeed with the legacy token
+        let valid = backend.verify_token(legacy_token).await.expect("verify legacy failed");
+        assert!(valid);
+
+        // Verification must have migrated the record in-place to SHA-256
+        let (migrated_token,): (String,) = sqlx::query_as("SELECT api_token FROM users WHERE username = 'legacy_user'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(migrated_token, DbBackend::hash_token(legacy_token));
 
         let _ = std::fs::remove_file(db_path);
     }

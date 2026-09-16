@@ -29,12 +29,28 @@ net_bridge=${net_bridge:-vmbr0}
 
 read -p "Enter SecureWeb Gateway URL (optional, e.g. http://10.0.1.50:8080): " secureweb_url
 
-echo "Generating Proxmox API Token..."
-TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json 2>/dev/null || true)
+echo "Configuring scoped Proxmox RBAC role and service user..."
+pveum role add HostableDeployer -privs "VM.Allocate VM.Audit VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.PowerMgmt Datastore.AllocateTemplate Datastore.AllocateSpace Datastore.Audit SDN.Use" 2>/dev/null || true
+pveum user add hostable@pve 2>/dev/null || true
+pveum acl modify / -user hostable@pve -role HostableDeployer 2>/dev/null || true
+
+echo "Generating scoped Proxmox API Token..."
+TOKEN_JSON=$(pveum user token add hostable@pve deployer --privsep 0 --output-format json 2>/dev/null || true)
 if [ -z "$TOKEN_JSON" ]; then
-    echo "Token root@pam!hostable might already exist. Regenerating..."
-    pveum user token delete root@pam hostable 2>/dev/null || true
-    TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json)
+    echo "Regenerating token hostable@pve!deployer..."
+    pveum user token delete hostable@pve deployer 2>/dev/null || true
+    TOKEN_JSON=$(pveum user token add hostable@pve deployer --privsep 0 --output-format json 2>/dev/null || true)
+fi
+
+TOKEN_ID="hostable@pve!deployer"
+if [ -z "$TOKEN_JSON" ]; then
+    echo "Falling back to root@pam token..."
+    TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json 2>/dev/null || true)
+    if [ -z "$TOKEN_JSON" ]; then
+        pveum user token delete root@pam hostable 2>/dev/null || true
+        TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json)
+    fi
+    TOKEN_ID="root@pam!hostable"
 fi
 
 TOKEN_SECRET=$(echo "$TOKEN_JSON" | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
@@ -79,7 +95,7 @@ pct exec "$vmid" -- mkdir -p /etc/hostable /etc/conf.d
 
 cat > /tmp/hostable.env << EOF
 PROXMOX_HOST="$PVE_HOST"
-PROXMOX_TOKEN_ID="root@pam!hostable"
+PROXMOX_TOKEN_ID="$TOKEN_ID"
 PROXMOX_TOKEN_SECRET="$TOKEN_SECRET"
 PORT="3000"
 HOSTABLE_DEFAULT_NETWORK="eth0"

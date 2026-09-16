@@ -348,10 +348,28 @@ pub async fn execute_deployment(
 
     if playbook_path.exists() {
         let vars_file = std::env::temp_dir().join(format!("hostable_vars_{}.json", task_id));
-        if let Ok(_) = std::fs::write(
-            &vars_file,
-            serde_json::to_string(&extra_vars).unwrap_or_default(),
-        ) {
+        let vars_json = serde_json::to_string(&extra_vars).unwrap_or_default();
+
+        let write_ok = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                if let Ok(mut f) = opts.open(&vars_file) {
+                    use std::io::Write;
+                    f.write_all(vars_json.as_bytes()).is_ok()
+                } else {
+                    false
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&vars_file, vars_json).is_ok()
+            }
+        };
+
+        if write_ok {
             engine
                 .emit_event(
                     &task_id,

@@ -9,6 +9,7 @@ pub struct ProxmoxClient {
     base_url: String,
     token_id: String,
     token_secret: String,
+    insecure: bool,
 }
 
 impl ProxmoxClient {
@@ -29,7 +30,12 @@ impl ProxmoxClient {
             base_url: format!("https://{}:8006/api2/json", host),
             token_id,
             token_secret,
+            insecure,
         }
+    }
+
+    pub fn is_insecure(&self) -> bool {
+        self.insecure
     }
 
     fn auth_header(&self) -> String {

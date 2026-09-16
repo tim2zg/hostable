@@ -218,8 +218,10 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
     use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 
     let mut builder = TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
+    if state.proxmox.is_insecure() {
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
     let connector = match builder.build() {
         Ok(c) => Connector::NativeTls(c),
         Err(e) => {
