@@ -1,147 +1,53 @@
 #!/bin/bash
-set -e
-
-echo "========================================="
-echo "   Hostable Platform Setup (Proxmox)     "
-echo "========================================="
-
-if ! command -v pveum &> /dev/null; then
-    echo "Error: This script must be run directly on a Proxmox host as root!"
-    exit 1
+set -euo pipefail
+umask 077
+[[ $EUID -eq 0 ]] && command -v pveum >/dev/null || { echo "Run as root on a Proxmox host."; exit 1; }
+read -r -p "Manager VMID [999]: " vmid; vmid=${vmid:-999}
+read -r -p "Root storage [local-lvm]: " storage; storage=${storage:-local-lvm}
+read -r -p "Template storage [local]: " templates; templates=${templates:-local}
+read -r -p "Bridge [vmbr0]: " bridge; bridge=${bridge:-vmbr0}
+read -r -p "Proxmox host address reachable from the manager guest: " pve_host
+[[ $vmid =~ ^[0-9]+$ && $vmid -ge 100 && $storage =~ ^[A-Za-z0-9_.-]+$ && $templates =~ ^[A-Za-z0-9_.-]+$ && $bridge =~ ^[A-Za-z0-9_.-]+$ && $pve_host =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid settings"; exit 1; }
+[[ $pve_host != 127.* && $pve_host != localhost ]] || { echo "Use a host address reachable from the guest."; exit 1; }
+if pct config "$vmid" >/dev/null 2>&1 || qm config "$vmid" >/dev/null 2>&1; then
+  echo "VMID already exists. Upgrade from inside its guest with install_in_lxc.sh; credentials will be preserved."; exit 1
 fi
-
-echo "Fetching latest Hostable binary from GitHub..."
-wget -qO hostable-linux-amd64 https://github.com/tim2zg/hostable/releases/latest/download/hostable-linux-amd64 || {
-    echo "Warning: No pre-compiled binary available yet from releases. Using local binary if present."
-}
-if [ -f hostable-linux-amd64 ]; then
-    chmod +x hostable-linux-amd64
-fi
-
-read -p "Enter a VMID for the Hostable Manager LXC [default: 999]: " vmid
-vmid=${vmid:-999}
-
-read -p "Enter the Storage Pool for the LXC [default: local-lvm]: " storage_id
-storage_id=${storage_id:-local-lvm}
-
-read -p "Enter Default Network Bridge [default: vmbr0]: " net_bridge
-net_bridge=${net_bridge:-vmbr0}
-
-read -p "Enter SecureWeb Gateway URL (optional, e.g. http://10.0.1.50:8080): " secureweb_url
-
-echo "Configuring scoped Proxmox RBAC role and service user..."
-pveum role add HostableDeployer -privs "VM.Allocate VM.Audit VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.PowerMgmt Datastore.AllocateTemplate Datastore.AllocateSpace Datastore.Audit SDN.Use" 2>/dev/null || true
-pveum user add hostable@pve 2>/dev/null || true
-pveum acl modify / -user hostable@pve -role HostableDeployer 2>/dev/null || true
-
-echo "Generating scoped Proxmox API Token..."
-TOKEN_JSON=$(pveum user token add hostable@pve deployer --privsep 0 --output-format json 2>/dev/null || true)
-if [ -z "$TOKEN_JSON" ]; then
-    echo "Regenerating token hostable@pve!deployer..."
-    pveum user token delete hostable@pve deployer 2>/dev/null || true
-    TOKEN_JSON=$(pveum user token add hostable@pve deployer --privsep 0 --output-format json 2>/dev/null || true)
-fi
-
-TOKEN_ID="hostable@pve!deployer"
-if [ -z "$TOKEN_JSON" ]; then
-    echo "Falling back to root@pam token..."
-    TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json 2>/dev/null || true)
-    if [ -z "$TOKEN_JSON" ]; then
-        pveum user token delete root@pam hostable 2>/dev/null || true
-        TOKEN_JSON=$(pveum user token add root@pam hostable --privsep 0 --output-format json)
-    fi
-    TOKEN_ID="root@pam!hostable"
-fi
-
-TOKEN_SECRET=$(echo "$TOKEN_JSON" | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
-PVE_HOST="127.0.0.1"
-
-echo "Downloading Alpine template..."
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
 pveam update
-pveam download local alpine-3.20-default_20240606_amd64.tar.xz 2>/dev/null || pveam download local alpine-3.18-default_20230622_amd64.tar.xz || true
-
-TEMPLATE=$(pveam list local | grep -E "alpine.*default.*amd64\.tar\.xz" | tail -n 1 | awk '{print $1}')
-if [ -z "$TEMPLATE" ]; then
-    TEMPLATE="local:vztmpl/alpine-3.20-default_20240606_amd64.tar.xz"
-fi
-
-echo "Creating LXC Container $vmid..."
-pct create "$vmid" "$TEMPLATE" \
-    -net0 "name=eth0,bridge=$net_bridge,ip=dhcp" \
-    -storage "$storage_id" \
-    -memory 2048 \
-    -cores 2 \
-    -unprivileged 1 \
-    -features nesting=1 \
-    -hostname "hostable-manager"
-
-pct set "$vmid" -onboot 1
-
-echo "Booting LXC Container for package setup..."
+template=$(pveam available --section system | awk '$2 ~ /^debian-13-standard_.*amd64\.tar\.(zst|xz|gz)$/ {print $2}' | sort -V | tail -1)
+[[ -n $template ]] || { echo "Debian 13 standard template unavailable; select a supported template manually."; exit 1; }
+pveam download "$templates" "$template"
+privileges="VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.AllocateTemplate Datastore.AllocateSpace Datastore.Audit SDN.Use"
+if pveum role list --output-format json | python3 -c 'import json,sys; sys.exit(not any(r["roleid"]=="HostableDeployer" for r in json.load(sys.stdin)))'; then
+  pveum role modify HostableDeployer -privs "$privileges"
+else pveum role add HostableDeployer -privs "$privileges"; fi
+if ! pveum user list --output-format json | python3 -c 'import json,sys; sys.exit(not any(r["userid"]=="hostable@pve" for r in json.load(sys.stdin)))'; then pveum user add hostable@pve; fi
+pveum acl modify / -user hostable@pve -role HostableDeployer
+# A new token is created for this manager. Existing tokens are never revoked.
+pveum user token add hostable@pve "manager-$vmid" --privsep 0 --output-format json > "$work/token.json"
+token_secret=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])' < "$work/token.json")
+cat > "$work/env" <<EOF
+PROXMOX_HOST=$pve_host
+PROXMOX_TOKEN_ID=hostable@pve!manager-$vmid
+PROXMOX_TOKEN_SECRET=$token_secret
+PROXMOX_CA_CERT=/etc/hostable/proxmox-ca.pem
+PROXMOX_INSECURE_TLS=false
+HOSTABLE_DATA_DIR=/etc/hostable
+HOSTABLE_DEFAULT_BRIDGE=$bridge
+DATABASE_URL=sqlite:///etc/hostable/hostable.db?mode=rwc
+PORT=3000
+EOF
+pct create "$vmid" "$templates:vztmpl/$template" --net0 "name=eth0,bridge=$bridge,ip=dhcp" --rootfs "$storage:8" --memory 2048 --cores 2 --unprivileged 1 --features nesting=1 --hostname hostable-manager --onboot 1
 pct start "$vmid"
-sleep 5
-
-echo "Installing runtime dependencies (Ansible, OpenRC, CA-Certs)..."
-pct exec "$vmid" -- apk update
-pct exec "$vmid" -- apk add --no-cache ansible python3 ca-certificates curl tar xz
-
-if [ -f ./hostable-linux-amd64 ]; then
-    echo "Pushing Hostable binary to container..."
-    pct push "$vmid" ./hostable-linux-amd64 /usr/local/bin/hostable -perms 755
-fi
-
-echo "Creating configuration..."
-pct exec "$vmid" -- mkdir -p /etc/hostable /etc/conf.d
-
-cat > /tmp/hostable.env << EOF
-PROXMOX_HOST="$PVE_HOST"
-PROXMOX_TOKEN_ID="$TOKEN_ID"
-PROXMOX_TOKEN_SECRET="$TOKEN_SECRET"
-PORT="3000"
-HOSTABLE_DEFAULT_NETWORK="eth0"
-HOSTABLE_DEFAULT_BRIDGE="$net_bridge"
-SECUREWEB_GATEWAY_URL="$secureweb_url"
-DATABASE_URL="sqlite:///etc/hostable/hostable.db?mode=rwc"
-EOF
-
-pct push "$vmid" /tmp/hostable.env /etc/hostable/.env -perms 600
-
-cat > /tmp/hostable.init << 'EOF'
-#!/sbin/openrc-run
-description="Hostable Platform Manager"
-command="/usr/local/bin/hostable"
-command_args="start"
-command_background="yes"
-pidfile="/run/hostable.pid"
-directory="/etc/hostable"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-
-pct push "$vmid" /tmp/hostable.init /etc/init.d/hostable -perms 755
-
-echo "Enabling and starting Hostable service..."
-pct exec "$vmid" -- rc-update add hostable default
-pct exec "$vmid" -- rc-service hostable restart
-
-sleep 3
-CONTAINER_IP=$(pct exec "$vmid" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || echo "DHCP Pending")
-
-rm -f /tmp/hostable.env /tmp/hostable.init ./hostable-linux-amd64
-
-echo ""
-echo "==============================================================="
-echo "🎉 HOSTABLE PLATFORM DEPLOYED SUCCESSFULLY!"
-echo "==============================================================="
-echo "🌐 Web Dashboard: http://${CONTAINER_IP}:3000"
-echo "🔐 Container VMID: $vmid"
-echo "📁 Database: Embedded SQLite (/etc/hostable/hostable.db)"
-echo "🤖 Invisible Ansible Engine: Ready (/usr/bin/ansible)"
-echo ""
-echo "To view your Admin API Token, run:"
-echo "pct exec $vmid -- grep -E 'Admin API Token' /var/log/messages || pct exec $vmid -- cat /etc/hostable/.env"
-echo "==============================================================="
-
+for attempt in {1..60}; do if pct exec "$vmid" -- true >/dev/null 2>&1; then break; fi; sleep 1; done
+pct exec "$vmid" -- mkdir -p /etc/hostable
+pct exec "$vmid" -- chmod 700 /etc/hostable
+pct push "$vmid" "$work/env" /etc/hostable/.env -perms 600
+pct push "$vmid" /etc/pve/pve-root-ca.pem /etc/hostable/proxmox-ca.pem -perms 644
+installer=$(dirname "$(readlink -f "$0")")/install_in_lxc.sh
+[[ -r $installer ]] || { echo "Keep install.sh and install_in_lxc.sh together."; exit 1; }
+pct push "$vmid" "$installer" /root/install-hostable.sh -perms 700
+pct exec "$vmid" -- bash /root/install-hostable.sh
+echo "Manager LXC $vmid installed. Retrieve its token with: pct exec $vmid -- cat /etc/hostable/admin-token"
+echo "Verify Proxmox connectivity in the dashboard before deploying workloads."

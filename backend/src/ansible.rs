@@ -1,33 +1,82 @@
+pub use crate::jobs::JobEngine as AnsibleEngine;
 use axum::{
     Json,
     extract::{
-        Path as AxPath, State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{RwLock, broadcast};
+use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountPointParam {
-    pub host: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub storage: Option<String>,
+    #[serde(default)]
+    pub size_gb: Option<u32>,
     pub container: String,
     #[serde(default)]
     pub ro: bool,
 }
+impl MountPointParam {
+    pub fn spec(&self) -> Result<String, String> {
+        if !crate::proxmox::valid_mount_path(&self.container)
+            || self.container == "/"
+            || self.container.split('/').any(|p| p == "..")
+        {
+            return Err("Invalid mount path".into());
+        }
+        let source = match (&self.host, &self.storage, self.size_gb) {
+            (Some(host), None, None)
+                if crate::proxmox::valid_mount_path(host)
+                    && !host.split('/').any(|p| p == "..") =>
+            {
+                host.clone()
+            }
+            (None, Some(storage), Some(size))
+                if identifier(storage) && (1..=65536).contains(&size) =>
+            {
+                format!("{}:{}", storage, size)
+            }
+            _ => {
+                return Err(
+                    "Specify either an absolute bind mount or a storage pool and size_gb".into(),
+                );
+            }
+        };
+        Ok(format!(
+            "{},mp={},backup=1{}",
+            source,
+            self.container,
+            if self.ro { ",ro=1" } else { "" }
+        ))
+    }
+}
+pub fn identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnsibleDeployParams {
+    #[serde(default)]
     pub vmid: u32,
+    #[serde(default)]
+    pub node: Option<String>,
     pub hostname: String,
+    #[serde(default)]
     pub image: String,
     #[serde(default)]
     pub ostemplate: Option<String>,
@@ -37,12 +86,15 @@ pub struct AnsibleDeployParams {
     pub memory: u32,
     #[serde(default = "default_disk")]
     pub disk_size: String,
-    #[serde(default = "default_storage")]
+    #[serde(default = "default_template")]
+    pub template_storage: String,
+    #[serde(default = "default_storage", alias = "rootfs_storage")]
     pub storage_pool: String,
     #[serde(default = "default_bridge")]
     pub net_bridge: String,
     #[serde(default = "default_ip")]
     pub ip_address: String,
+    #[serde(default)]
     pub gateway: Option<String>,
     #[serde(default)]
     pub mountpoints: Vec<MountPointParam>,
@@ -50,15 +102,25 @@ pub struct AnsibleDeployParams {
     pub env_vars: HashMap<String, String>,
     #[serde(default)]
     pub expose_secureweb: bool,
+    #[serde(default)]
     pub secureweb_domain: Option<String>,
-    #[serde(default = "default_port")]
+    #[serde(default)]
     pub app_port: Option<u16>,
     #[serde(default)]
     pub default_network: Option<String>,
     #[serde(default)]
     pub target_subnet: Option<String>,
+    #[serde(default)]
+    pub database_id: Option<String>,
+    #[serde(default)]
+    pub ssh_public_key: Option<String>,
+    #[serde(default)]
+    pub recipe: Option<crate::recipes::RecipeRef>,
+    #[serde(default)]
+    pub health: crate::recipes::HealthCheck,
+    #[serde(default)]
+    pub update: crate::recipes::UpdatePolicy,
 }
-
 fn default_cores() -> u32 {
     2
 }
@@ -66,691 +128,683 @@ fn default_memory() -> u32 {
     1024
 }
 fn default_disk() -> String {
-    "8G".to_string()
+    "8G".into()
+}
+fn default_template() -> String {
+    "local".into()
 }
 fn default_storage() -> String {
-    "local-zfs".to_string()
+    "local-lvm".into()
 }
 fn default_bridge() -> String {
-    "vmbr0".to_string()
+    std::env::var("HOSTABLE_DEFAULT_BRIDGE").unwrap_or_else(|_| "vmbr0".into())
 }
 fn default_ip() -> String {
-    "dhcp".to_string()
-}
-fn default_port() -> Option<u16> {
-    Some(80)
+    "dhcp".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskEvent {
-    pub task_id: String,
-    pub timestamp: String,
-    pub level: String, // info, task, ok, warn, error
-    pub step: String,
-    pub message: String,
-}
-
-pub struct AnsibleEngine {
-    tasks: Arc<RwLock<HashMap<String, Vec<TaskEvent>>>>,
-    event_bus: broadcast::Sender<TaskEvent>,
-}
-
-impl AnsibleEngine {
-    pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(500);
-        Self {
-            tasks: Arc::new(RwLock::new(HashMap::new())),
-            event_bus: tx,
-        }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
-        self.event_bus.subscribe()
-    }
-
-    pub async fn emit_event(&self, task_id: &str, level: &str, step: &str, message: &str) {
-        let now = chrono_now();
-        let ev = TaskEvent {
-            task_id: task_id.to_string(),
-            timestamp: now,
-            level: level.to_string(),
-            step: step.to_string(),
-            message: message.to_string(),
-        };
-
+pub fn validate_deploy_params(p: &AnsibleDeployParams) -> Result<(), String> {
+    p.health.validate()?;
+    p.update.validate()?;
+    if let Some(key) = &p.ssh_public_key {
+        if key.len() > 4096
+            || key.contains(['\n', '\r'])
+            || !(key.starts_with("ssh-ed25519 ") || key.starts_with("ssh-rsa "))
         {
-            let mut tasks = self.tasks.write().await;
-            tasks
-                .entry(task_id.to_string())
-                .or_default()
-                .push(ev.clone());
+            return Err("Invalid SSH public key".into());
         }
-
-        let _ = self.event_bus.send(ev);
     }
-
-    pub async fn get_events(&self, task_id: &str) -> Vec<TaskEvent> {
-        let tasks = self.tasks.read().await;
-        tasks.get(task_id).cloned().unwrap_or_default()
+    if p.ostemplate.is_none() && !crate::oci::validate_image_ref(&p.image) {
+        return Err("Invalid image reference".into());
+    }
+    if p.ostemplate.is_some() && (!p.env_vars.is_empty() || p.database_id.is_some()) {
+        return Err("Application environment injection requires an OCI image".into());
+    }
+    if p.ostemplate.is_some() && !p.image.is_empty() {
+        return Err("Choose an OS template or an OCI image".into());
+    }
+    if let Some(t) = &p.ostemplate {
+        let (storage, file) = t
+            .split_once(":vztmpl/")
+            .ok_or("Invalid OS template reference")?;
+        if !identifier(storage)
+            || file.contains('/')
+            || !(file.ends_with(".tar.xz")
+                || file.ends_with(".tar.zst")
+                || file.ends_with(".tar.gz"))
+            || !crate::proxmox::valid_opt_value(file)
+        {
+            return Err("Invalid OS template".into());
+        }
+    }
+    if !crate::proxmox::valid_hostname(&p.hostname) {
+        return Err("Invalid hostname".into());
+    }
+    if !identifier(&p.template_storage)
+        || !identifier(&p.storage_pool)
+        || !identifier(&p.net_bridge)
+        || p.node.as_ref().is_some_and(|n| !identifier(n))
+    {
+        return Err("Invalid storage, node or bridge".into());
+    }
+    if p.vmid != 0 && !(100..=999999999).contains(&p.vmid) {
+        return Err("VMID must be at least 100 or zero for automatic allocation".into());
+    }
+    if !(1..=128).contains(&p.cores) || !(64..=1048576).contains(&p.memory) {
+        return Err("CPU or memory outside supported bounds".into());
+    }
+    disk_gb(&p.disk_size)?;
+    validate_ip(&p.ip_address)?;
+    if p.target_subnet
+        .as_ref()
+        .is_some_and(|s| !crate::databases::valid_cidr(s) || s.contains(':'))
+    {
+        return Err("Preferred subnet must be an IPv4 CIDR".into());
+    }
+    if let Some(gw) = &p.gateway {
+        if !gw.is_empty() && gw.parse::<std::net::IpAddr>().is_err() {
+            return Err("Invalid gateway".into());
+        }
+    }
+    if let Some(iface) = &p.default_network {
+        if !crate::proxmox::valid_iface_name(iface) {
+            return Err("Invalid network interface".into());
+        }
+    }
+    let mut paths = std::collections::HashSet::new();
+    for mp in &p.mountpoints {
+        mp.spec()?;
+        if !paths.insert(&mp.container) {
+            return Err("Duplicate volume mount path".into());
+        }
+    }
+    for (key, value) in &p.env_vars {
+        if !crate::oci::valid_env_key(key) || value.contains('\0') {
+            return Err("Invalid environment variable".into());
+        }
+    }
+    if p.expose_secureweb
+        && !p
+            .secureweb_domain
+            .as_ref()
+            .is_some_and(|d| crate::secureweb::valid_domain(d))
+    {
+        return Err("A valid domain is required for ingress".into());
+    }
+    if p.app_port == Some(0) {
+        return Err("Port must be greater than zero".into());
+    }
+    Ok(())
+}
+pub fn disk_gb(s: &str) -> Result<u32, String> {
+    let s = s
+        .strip_suffix("GB")
+        .or_else(|| s.strip_suffix('G'))
+        .unwrap_or(s);
+    let n: u32 = s
+        .parse()
+        .map_err(|_| "Disk size must be an integer in GiB".to_string())?;
+    if (1..=65536).contains(&n) {
+        Ok(n)
+    } else {
+        Err("Invalid disk size".into())
     }
 }
-
-fn chrono_now() -> String {
-    // Simple timestamp without external chrono dep
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs = now % 60;
-    let mins = (now / 60) % 60;
-    let hours = (now / 3600) % 24;
-    format!("{:02}:{:02}:{:02}Z", hours, mins, secs)
+pub fn validate_ip(s: &str) -> Result<(), String> {
+    if s == "dhcp" {
+        return Ok(());
+    }
+    let (ip, prefix) = s
+        .split_once('/')
+        .ok_or("Static address requires a CIDR prefix")?;
+    let ip: std::net::IpAddr = ip.parse().map_err(|_| "Invalid IP address")?;
+    let prefix: u8 = prefix.parse().map_err(|_| "Invalid CIDR prefix")?;
+    if !ip.is_ipv4() {
+        return Err("IPv4 static networking is supported in this release".into());
+    }
+    if prefix > 32 {
+        return Err("Invalid CIDR prefix".into());
+    }
+    Ok(())
 }
-
-// ==============================================================================
-// Orchestration Runner: Invisible Ansible with Native Fallback
-// ==============================================================================
+#[derive(Debug, Serialize)]
+pub struct DeploymentResult {
+    pub node: String,
+    pub vmid: u32,
+    pub ip: String,
+}
 
 pub async fn execute_deployment(
-    engine: Arc<AnsibleEngine>,
     state: Arc<crate::AppState>,
-    task_id: String,
-    params: AnsibleDeployParams,
+    task: String,
+    mut params: AnsibleDeployParams,
 ) {
-    engine
-        .emit_event(
-            &task_id,
-            "info",
-            "INIT",
-            &format!(
-                "Starting deployment for container {} ({})",
-                params.hostname, params.vmid
-            ),
-        )
-        .await;
-
-    // Acquire global deployment semaphore to prevent concurrent race conditions
-    engine
-        .emit_event(
-            &task_id,
-            "task",
-            "QUEUE",
-            "Waiting for global deployment permit...",
-        )
-        .await;
-
-    let _permit = match state.deployment_lock.acquire().await {
-        Ok(p) => {
-            engine
-                .emit_event(
-                    &task_id,
+    let result = deploy(&state, &task, &mut params).await;
+    match result {
+        Ok(result) => {
+            let _ = state
+                .ansible
+                .event(
+                    &task,
                     "ok",
-                    "QUEUE",
-                    "Deployment permit acquired. Starting provisioning pipeline.",
-                )
-                .await;
-            p
-        }
-        Err(e) => {
-            engine
-                .emit_event(
-                    &task_id,
-                    "failed",
-                    "QUEUE",
-                    &format!("Failed to acquire deployment lock: {}", e),
-                )
-                .await;
-            return;
-        }
-    };
-
-    let node = state.default_node.clone();
-    let template_storage = params.storage_pool.clone();
-    let filename = format!("hostable_vmid_{}.tar.xz", params.vmid);
-    let cache_dir = PathBuf::from("/cache");
-    let out_path = cache_dir.join(&filename);
-
-    // 1. OCI Image Extraction (Pure Rust Extractor)
-    engine
-        .emit_event(
-            &task_id,
-            "task",
-            "OCI_PULL",
-            &format!("Resolving and extracting OCI image '{}'...", params.image),
-        )
-        .await;
-
-    let env_list: Vec<String> = params
-        .env_vars
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-    let extractor = crate::oci::OciExtractor::new();
-
-    if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
-    }
-
-    let template_ref = format!("{}:vztmpl/{}", template_storage, filename);
-
-    match extractor
-        .extract_to_dir(&params.image, &out_path, Some(&env_list), None)
-        .await
-    {
-        Ok(_) => {
-            engine
-                .emit_event(
-                    &task_id,
-                    "ok",
-                    "OCI_EXTRACT",
-                    "OCI image layers successfully flattened and compressed.",
-                )
-                .await;
-
-            // Upload to Proxmox
-            engine
-                .emit_event(
-                    &task_id,
-                    "task",
-                    "PVE_UPLOAD",
+                    "COMPLETE",
                     &format!(
-                        "Publishing template to Proxmox storage '{}'...",
-                        template_storage
-                    ),
-                )
-                .await;
-            match state
-                .proxmox
-                .upload_template(&node, &template_storage, &out_path, &filename)
-                .await
-            {
-                Ok(_) => {
-                    engine
-                        .emit_event(
-                            &task_id,
-                            "ok",
-                            "PVE_UPLOAD",
-                            "Template successfully registered in Proxmox storage.",
-                        )
-                        .await;
-                    // Clean up local tar.xz template immediately after upload to prevent disk leak
-                    if out_path.exists() {
-                        let _ = std::fs::remove_file(&out_path);
-                    }
-                }
-                Err(e) => {
-                    engine
-                        .emit_event(
-                            &task_id,
-                            "warn",
-                            "PVE_UPLOAD",
-                            &format!("Template upload warning (might exist): {}", e),
-                        )
-                        .await;
-                    if out_path.exists() {
-                        let _ = std::fs::remove_file(&out_path);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            engine
-                .emit_event(
-                    &task_id,
-                    "warn",
-                    "OCI_EXTRACT",
-                    &format!(
-                        "Direct OCI pull notice: {}. Checking existing template...",
-                        e
+                        "{} is running at {} (LXC {} on {})",
+                        params.hostname, result.ip, result.vmid, result.node
                     ),
                 )
                 .await;
         }
-    }
-
-    // 2. Prepare Ansible Playbook Execution
-    let ostemplate = params.ostemplate.clone().unwrap_or(template_ref);
-    let proxmox_host = std::env::var("PROXMOX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let proxmox_token_id = std::env::var("PROXMOX_TOKEN_ID").unwrap_or_default();
-    let proxmox_token_secret = std::env::var("PROXMOX_TOKEN_SECRET").unwrap_or_default();
-    let secureweb_gateway_url = state.secureweb.gateway_url.clone();
-
-    let extra_vars = json!({
-        "proxmox_host": proxmox_host,
-        "proxmox_token_id": proxmox_token_id,
-        "proxmox_token_secret": proxmox_token_secret,
-        "node": node,
-        "vmid": params.vmid,
-        "hostname": params.hostname,
-        "ostemplate": ostemplate,
-        "cores": params.cores,
-        "memory": params.memory,
-        "disk_size": params.disk_size,
-        "storage_pool": params.storage_pool,
-        "net_bridge": params.net_bridge,
-        "ip_address": params.ip_address,
-        "gateway": params.gateway.clone().unwrap_or_default(),
-        "mountpoints": params.mountpoints.iter().map(|mp| json!({
-            "host": mp.host,
-            "container": mp.container,
-            "ro": mp.ro
-        })).collect::<Vec<_>>(),
-        "env_vars": params.env_vars,
-        "expose_secureweb": params.expose_secureweb,
-        "secureweb_url": secureweb_gateway_url,
-        "secureweb_domain": params.secureweb_domain.clone().unwrap_or_default(),
-        "app_port": params.app_port.unwrap_or(80),
-        "target_network": params.default_network.clone().unwrap_or_else(|| "eth0".to_string())
-    });
-
-    let playbook_path = PathBuf::from("ansible/playbooks/deploy_lxc.yml");
-    let mut ansible_succeeded = false;
-
-    if playbook_path.exists() {
-        let vars_file = std::env::temp_dir().join(format!("hostable_vars_{}.json", task_id));
-        let vars_json = serde_json::to_string(&extra_vars).unwrap_or_default();
-
-        let write_ok = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut opts = std::fs::OpenOptions::new();
-                opts.write(true).create(true).truncate(true).mode(0o600);
-                if let Ok(mut f) = opts.open(&vars_file) {
-                    use std::io::Write;
-                    f.write_all(vars_json.as_bytes()).is_ok()
-                } else {
-                    false
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&vars_file, vars_json).is_ok()
-            }
-        };
-
-        if write_ok {
-            engine
-                .emit_event(
-                    &task_id,
-                    "task",
-                    "ANSIBLE_EXEC",
-                    "Spawning invisible Ansible automation engine...",
-                )
-                .await;
-
-            let cmd_res = tokio::process::Command::new("ansible-playbook")
-                .arg(&playbook_path)
-                .arg("-e")
-                .arg(format!("@{}", vars_file.display()))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-
-            match cmd_res {
-                Ok(mut child) => {
-                    let stdout = child.stdout.take();
-                    let engine_clone = engine.clone();
-                    let tid = task_id.clone();
-
-                    if let Some(out) = stdout {
-                        tokio::spawn(async move {
-                            let mut reader = BufReader::new(out).lines();
-                            while let Ok(Some(line)) = reader.next_line().await {
-                                let trimmed = line.trim();
-                                if trimmed.starts_with("TASK [") {
-                                    let task_name =
-                                        trimmed.trim_start_matches("TASK [").trim_end_matches(']');
-                                    engine_clone
-                                        .emit_event(&tid, "task", "ANSIBLE_STEP", task_name)
-                                        .await;
-                                } else if trimmed.starts_with("ok:")
-                                    || trimmed.starts_with("changed:")
-                                {
-                                    engine_clone
-                                        .emit_event(&tid, "ok", "ANSIBLE_ITEM", trimmed)
-                                        .await;
-                                } else if trimmed.starts_with("fatal:")
-                                    || trimmed.starts_with("failed:")
-                                {
-                                    engine_clone
-                                        .emit_event(&tid, "error", "ANSIBLE_FAIL", trimmed)
-                                        .await;
-                                } else if !trimmed.is_empty() {
-                                    engine_clone
-                                        .emit_event(&tid, "info", "ANSIBLE_LOG", trimmed)
-                                        .await;
-                                }
-                            }
-                        });
-                    }
-
-                    if let Ok(status) = child.wait().await {
-                        let _ = std::fs::remove_file(&vars_file);
-                        if status.success() {
-                            ansible_succeeded = true;
-                            engine
-                                .emit_event(
-                                    &task_id,
-                                    "ok",
-                                    "ANSIBLE_DONE",
-                                    "Ansible automation completed successfully!",
-                                )
-                                .await;
-                        }
-                    }
-                }
-                Err(_) => {
-                    engine.emit_event(&task_id, "info", "ANSIBLE_NOTICE", "Ansible CLI not in PATH. Running seamless internal native orchestrator...").await;
-                }
-            }
-        }
-    }
-
-    // 3. Resilient Fallback Orchestrator (Direct Proxmox API with Task Polling & Zero Data Loss)
-    if !ansible_succeeded {
-        engine
-            .emit_event(
-                &task_id,
-                "task",
-                "PVE_ORCHESTRATE",
-                "Configuring LXC container via Proxmox API...",
-            )
-            .await;
-
-        let mut params_map = HashMap::new();
-        params_map.insert("vmid".to_string(), params.vmid.to_string());
-        params_map.insert("hostname".to_string(), params.hostname.clone());
-        params_map.insert("ostemplate".to_string(), ostemplate);
-        params_map.insert("cores".to_string(), params.cores.to_string());
-        params_map.insert("memory".to_string(), params.memory.to_string());
-        params_map.insert("storage".to_string(), params.storage_pool.clone());
-        let disk_num: String = params
-            .disk_size
-            .chars()
-            .filter(|c| c.is_numeric())
-            .collect();
-        params_map.insert(
-            "rootfs".to_string(),
-            format!(
-                "{}:{}",
-                params.storage_pool,
-                if disk_num.is_empty() { "8" } else { &disk_num }
-            ),
-        );
-
-        let net_str = format!(
-            "name=eth0,bridge={},ip={}",
-            params.net_bridge, params.ip_address
-        );
-        params_map.insert("net0".to_string(), net_str);
-        params_map.insert("unprivileged".to_string(), "1".to_string());
-        params_map.insert("features".to_string(), "nesting=1".to_string());
-        params_map.insert("tags".to_string(), "hostable,managed".to_string());
-
-        // Map persistent volumes
-        for (i, mp) in params.mountpoints.iter().enumerate() {
-            params_map.insert(
-                format!("mp{}", i),
-                format!("{},mp={}", mp.host, mp.container),
+        Err(error) => {
+            tracing::error!("Deployment {} failed: {}", task, error);
+            let error = format!(
+                "{}. Requested/assigned VMID {} on {}. Inspect partial resources before retrying.",
+                error,
+                params.vmid,
+                params.node.as_deref().unwrap_or(&state.default_node)
             );
-        }
-
-        match state
-            .proxmox
-            .create_lxc(&node, params.vmid, params_map)
-            .await
-        {
-            Ok(val) => {
-                if let Some(upid) = val["data"].as_str() {
-                    engine
-                        .emit_event(
-                            &task_id,
-                            "task",
-                            "PVE_TASK",
-                            &format!("Waiting for creation task {} to finish...", upid),
-                        )
-                        .await;
-                    let _ = state.proxmox.wait_for_task(&node, upid).await;
-                }
-                engine
-                    .emit_event(
-                        &task_id,
-                        "ok",
-                        "PVE_CREATE",
-                        "LXC Container provisioned successfully.",
-                    )
-                    .await;
-
-                // Start Container
-                engine
-                    .emit_event(&task_id, "task", "PVE_START", "Starting container...")
-                    .await;
-                let _ = state.proxmox.start_lxc(&node, params.vmid).await;
-                engine
-                    .emit_event(&task_id, "ok", "PVE_START", "Container is now running.")
-                    .await;
-            }
-            Err(e) => {
-                engine
-                    .emit_event(
-                        &task_id,
-                        "warn",
-                        "PVE_CREATE",
-                        &format!("Create response: {}", e),
-                    )
-                    .await;
-                // Attempt starting if it already exists
-                let _ = state.proxmox.start_lxc(&node, params.vmid).await;
-            }
+            state.ansible.finish_error(&task, &error).await;
         }
     }
+}
 
-    // 4. IP Discovery & SecureWeb Gateway Registration
-    let target_iface = params
+pub async fn deploy(
+    state: &Arc<crate::AppState>,
+    task: &str,
+    params: &mut AnsibleDeployParams,
+) -> Result<DeploymentResult, String> {
+    deploy_mode(state, task, params, true).await
+}
+
+pub async fn prepare(
+    state: &Arc<crate::AppState>,
+    task: &str,
+    params: &mut AnsibleDeployParams,
+) -> Result<DeploymentResult, String> {
+    deploy_mode(state, task, params, false).await
+}
+
+async fn deploy_mode(
+    state: &Arc<crate::AppState>,
+    task: &str,
+    params: &mut AnsibleDeployParams,
+    start: bool,
+) -> Result<DeploymentResult, String> {
+    validate_deploy_params(params)?;
+    if let Some(reference) = &params.recipe {
+        let recipe = crate::recipes::resolve(state, &reference.id, reference.version).await?;
+        for key in &recipe.required_env {
+            if !params.env_vars.contains_key(key) {
+                return Err(format!("Recipe requires environment variable {}", key));
+            }
+        }
+        if params.health.port.is_none() {
+            params.health = recipe.health;
+        }
+        params.update = recipe.update;
+    }
+    if params.health.port.is_none() {
+        params.health.port = params.app_port;
+    }
+    state.ansible.check_cancel(task).await?;
+    state
+        .ansible
+        .event(task, "task", "QUEUE", "Waiting for deployment slot")
+        .await?;
+    let _permit = state
+        .deployment_lock
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+    let node = params
+        .node
+        .clone()
+        .unwrap_or_else(|| state.default_node.clone());
+    state
+        .ansible
+        .event(
+            task,
+            "task",
+            "PREFLIGHT",
+            "Checking resources, storage and network",
+        )
+        .await?;
+    let resources = state.proxmox.get_cluster_resources().await?;
+    let metadata = state.db.as_ref().ok_or("Metadata unavailable")?;
+    let mut reserved = std::collections::HashSet::new();
+    for w in metadata.list_records("workload").await? {
+        if let Some(n) = w["active"]["vmid"].as_u64() {
+            reserved.insert(n);
+        }
+        if let Some(rows) = w["previous"].as_array() {
+            for r in rows {
+                if let Some(n) = r["vmid"].as_u64() {
+                    reserved.insert(n);
+                }
+            }
+        }
+        if let Some(n) = w["id"].as_str().and_then(|s| s.parse::<u64>().ok()) {
+            reserved.insert(n);
+        }
+    }
+    if params.vmid == 0 {
+        params.vmid = state.proxmox.get_next_vmid().await?;
+        while reserved.contains(&u64::from(params.vmid))
+            || resources["data"].as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|r| r["vmid"].as_u64() == Some(params.vmid as u64))
+            })
+        {
+            params.vmid = params
+                .vmid
+                .checked_add(1)
+                .filter(|v| *v <= 999999999)
+                .ok_or("No available VMID")?;
+        }
+    }
+    if reserved.contains(&u64::from(params.vmid)) {
+        return Err("VMID is reserved by a managed workload or retained revision; its metadata cannot be overwritten".into());
+    }
+    if !(100..=999999999).contains(&params.vmid) {
+        return Err("Proxmox returned an invalid VMID".into());
+    }
+    if resources["data"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|r| r["vmid"].as_u64() == Some(params.vmid as u64))
+    }) {
+        return Err(format!(
+            "VMID {} is already allocated; existing containers are never overwritten",
+            params.vmid
+        ));
+    }
+    crate::workloads::save_request(state, task, params).await?;
+    state
+        .proxmox
+        .validate_storage(&node, &params.storage_pool, "rootdir")
+        .await?;
+    if params.ostemplate.is_none() {
+        state
+            .proxmox
+            .validate_storage(&node, &params.template_storage, "vztmpl")
+            .await?;
+    }
+    for mp in &params.mountpoints {
+        if let Some(storage) = &mp.storage {
+            state
+                .proxmox
+                .validate_storage(&node, storage, "rootdir")
+                .await?;
+        }
+    }
+    if !state
+        .proxmox
+        .get_network_bridges(&node)
+        .await?
+        .contains(&params.net_bridge)
+    {
+        return Err("Selected network bridge is unavailable on this node".into());
+    }
+    let mut extra = HashMap::new();
+    if let Some(database_id) = &params.database_id {
+        let uri = crate::databases::application_uri(state, database_id).await?;
+        let uri = format!("{}&sslrootcert=/etc/hostable/database-ca.crt", uri);
+        extra.insert(
+            "etc/hostable/database-ca.crt".into(),
+            crate::databases::application_certificate(state, database_id).await?,
+        );
+        params.env_vars.insert("DATABASE_URL".into(), uri);
+    }
+    let cache = crate::runtime::data_dir().join("cache").join(task);
+    crate::runtime::private_dir(&cache)?;
+    let _cleanup = crate::runtime::CacheGuard(cache.clone());
+    let template = if let Some(template) = &params.ostemplate {
+        template.clone()
+    } else {
+        let pinned = crate::oci::OciExtractor::new()?
+            .resolved_image(&params.image)
+            .await?;
+        crate::workloads::record_image(state, task, &params.image, &pinned).await?;
+        state.ansible.check_cancel(task).await?;
+        state
+            .ansible
+            .event(
+                task,
+                "task",
+                "OCI_PULL",
+                "Downloading and converting OCI image",
+            )
+            .await?;
+        let filename = format!("hostable_{}.tar.xz", task);
+        let archive = cache.join(&filename);
+        let envs: Vec<_> = params
+            .env_vars
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        crate::oci::OciExtractor::new()?
+            .extract_to_dir(&pinned, &archive, Some(&envs), Some(extra))
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .ansible
+            .event(task, "task", "UPLOAD", "Uploading container template")
+            .await?;
+        let upload = state
+            .proxmox
+            .upload_template(&node, &params.template_storage, &archive, &filename)
+            .await?;
+        state.proxmox.wait_response_task(&node, upload).await?;
+        let _ = std::fs::remove_file(&archive);
+        format!("{}:vztmpl/{}", params.template_storage, filename)
+    };
+    state.ansible.check_cancel(task).await?;
+    let iface = params
         .default_network
         .clone()
-        .unwrap_or_else(|| std::env::var("HOSTABLE_DEFAULT_NETWORK").unwrap_or_else(|_| "eth0".to_string()));
-
-    engine
-        .emit_event(
-            &task_id,
+        .unwrap_or_else(|| "eth0".into());
+    let mut network = format!(
+        "name={},bridge={},ip={}",
+        iface, params.net_bridge, params.ip_address
+    );
+    if let Some(gateway) = &params.gateway {
+        if !gateway.is_empty() {
+            network.push_str(&format!(",gw={}", gateway));
+        }
+    }
+    let mut create = HashMap::from([
+        ("vmid".into(), params.vmid.to_string()),
+        ("hostname".into(), params.hostname.clone()),
+        ("ostemplate".into(), template.clone()),
+        ("cores".into(), params.cores.to_string()),
+        ("memory".into(), params.memory.to_string()),
+        (
+            "rootfs".into(),
+            format!("{}:{}", params.storage_pool, disk_gb(&params.disk_size)?),
+        ),
+        ("net0".into(), network),
+        ("unprivileged".into(), "1".into()),
+        ("onboot".into(), if start { "1" } else { "0" }.into()),
+        ("features".into(), "nesting=1".into()),
+        ("tags".into(), "hostable;managed".into()),
+        ("description".into(), format!("hostable.task={}", task)),
+    ]);
+    for (i, mount) in params.mountpoints.iter().enumerate() {
+        create.insert(format!("mp{}", i), mount.spec()?);
+    }
+    if let Some(key) = &params.ssh_public_key {
+        create.insert("ssh-public-keys".into(), key.clone());
+    }
+    state
+        .ansible
+        .event(
+            task,
             "task",
-            "NET_DISCOVERY",
-            &format!(
-                "Polling container network lease on interface '{}'...",
-                target_iface
-            ),
+            "PVE_CREATE",
+            "Creating unprivileged container",
         )
-        .await;
-
-    let discovered_ip = match state
+        .await?;
+    state
+        .proxmox
+        .wait_response_task(
+            &node,
+            state.proxmox.create_lxc(&node, params.vmid, create).await?,
+        )
+        .await?;
+    let db = state.db.as_ref().ok_or("Platform database unavailable")?;
+    db.put_record("container", &params.vmid.to_string(), &json!({"id":params.vmid,"node":node,"name":params.hostname,"image":params.image,"volumes":params.mountpoints,"task_id":task,"status":"created"})).await?;
+    crate::workloads::register(state, task, params, &node, start).await?;
+    if params.ostemplate.is_none() {
+        let filename = template
+            .split(":vztmpl/")
+            .nth(1)
+            .ok_or("Invalid generated template")?;
+        state.proxmox.delete_template(&node,&params.template_storage,filename).await.map_err(|_| "Container was created, but temporary template deletion failed. Remove the generated template from Proxmox storage before retrying.".to_string())?;
+    }
+    if !start {
+        return Ok(DeploymentResult {
+            node,
+            vmid: params.vmid,
+            ip: String::new(),
+        });
+    }
+    state.ansible.check_cancel(task).await?;
+    state
+        .ansible
+        .event(task, "task", "PVE_START", "Starting container")
+        .await?;
+    state
+        .proxmox
+        .wait_response_task(&node, state.proxmox.start_lxc(&node, params.vmid).await?)
+        .await?;
+    state
+        .proxmox
+        .wait_lxc_status(&node, params.vmid, "running")
+        .await?;
+    state
+        .ansible
+        .event(
+            task,
+            "task",
+            "NETWORK",
+            "Waiting for a real container address",
+        )
+        .await?;
+    let ip = state
         .proxmox
         .poll_lxc_ip(
             &node,
             params.vmid,
-            Some(&target_iface),
+            Some(&iface),
             params.target_subnet.as_deref(),
-            25,
+            30,
         )
-        .await
-    {
-        Ok(ip) => {
-            engine
-                .emit_event(
-                    &task_id,
-                    "ok",
-                    "NET_DISCOVERY",
-                    &format!("Assigned IP discovered: {} on '{}'", ip, target_iface),
+        .await?;
+    if let Some(port) = params.app_port {
+        state
+            .ansible
+            .event(
+                task,
+                "task",
+                "READINESS",
+                "Checking the application's listening port",
+            )
+            .await?;
+        let address = format!("{}:{}", ip, port);
+        let mut ready = false;
+        for _ in 0..30 {
+            if matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(&address)
                 )
-                .await;
-            ip
+                .await,
+                Ok(Ok(_))
+            ) {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        Err(err) => {
-            let fallback_ip = if params.ip_address != "dhcp" && !params.ip_address.is_empty() {
-                params
-                    .ip_address
-                    .split('/')
-                    .next()
-                    .unwrap_or(&params.ip_address)
-                    .to_string()
-            } else {
-                format!("10.0.1.{}", params.vmid)
-            };
-            engine
-                .emit_event(
-                    &task_id,
-                    "warn",
-                    "NET_DISCOVERY",
-                    &format!("{} - using fallback IP {}", err, fallback_ip),
-                )
-                .await;
-            fallback_ip
+        if !ready {
+            return Err(format!(
+                "Container is running but service on port {} is not ready",
+                port
+            ));
         }
-    };
-
+    }
+    let db = state.db.as_ref().ok_or("Platform database unavailable")?;
+    db.put_record("container", &params.vmid.to_string(), &json!({"id": params.vmid, "node": node, "name": params.hostname, "image": params.image, "volumes": params.mountpoints, "ip": ip, "created_at": crate::runtime::now(), "task_id": task})).await?;
+    crate::workloads::check_health(&ip, &params.health).await?;
+    crate::workloads::mark_ready(state, params.vmid, &ip).await?;
     if params.expose_secureweb {
-        if let Some(domain) = &params.secureweb_domain {
-            engine
-                .emit_event(
-                    &task_id,
-                    "task",
-                    "SECUREWEB_LINK",
-                    &format!(
-                        "Registering upstream domain '{}' -> {}:{} with SecureWeb Gateway...",
-                        domain,
-                        discovered_ip,
-                        params.app_port.unwrap_or(80)
-                    ),
-                )
-                .await;
-
-            let route = crate::secureweb::SecureWebRoute {
-                domain: domain.clone(),
-                target_ip: discovered_ip,
+        state
+            .ansible
+            .event(
+                task,
+                "task",
+                "INGRESS",
+                "Registering the upstream with the configured gateway",
+            )
+            .await?;
+        state
+            .secureweb
+            .register_route(crate::secureweb::SecureWebRoute {
+                domain: params.secureweb_domain.clone().ok_or("Domain missing")?,
+                target_ip: ip.clone(),
                 target_port: params.app_port.unwrap_or(80),
                 service_name: params.hostname.clone(),
                 vmid: params.vmid,
-                mode: "zero-trust".to_string(),
-                created_at: Some(chrono_now()),
-            };
-
-            match state.secureweb.register_route(route).await {
-                Ok(_) => {
-                    engine
-                        .emit_event(
-                            &task_id,
-                            "ok",
-                            "SECUREWEB_LINK",
-                            &format!(
-                                "Domain '{}' successfully secured and routed by SecureWeb!",
-                                domain
-                            ),
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    engine
-                        .emit_event(
-                            &task_id,
-                            "warn",
-                            "SECUREWEB_LINK",
-                            &format!("SecureWeb route registration notice: {}", e),
-                        )
-                        .await;
-                }
-            }
-        }
+                mode: "https".into(),
+                created_at: Some(crate::runtime::now().to_string()),
+            })
+            .await?;
     }
-
-    engine
-        .emit_event(
-            &task_id,
-            "ok",
-            "COMPLETE",
-            &format!(
-                "Deployment of {} (LXC {}) completed successfully!",
-                params.hostname, params.vmid
-            ),
-        )
-        .await;
-}
-
-// ==============================================================================
-// Axum Handlers
-// ==============================================================================
-
-#[derive(Serialize)]
-pub struct DeployTriggerResponse {
-    pub task_id: String,
-    pub status: String,
+    let _ = std::fs::remove_dir(&cache);
+    Ok(DeploymentResult {
+        node,
+        vmid: params.vmid,
+        ip,
+    })
 }
 
 pub async fn trigger_deploy_handler(
     _auth: crate::RequireAuth,
     State(state): State<Arc<crate::AppState>>,
     Json(params): Json<AnsibleDeployParams>,
-) -> impl IntoResponse {
-    let task_id = format!(
-        "task_{}_{}",
-        params.vmid,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
-    let engine = state.ansible.clone();
-    let state_clone = state.clone();
-    let tid = task_id.clone();
-
+) -> Response {
+    if let Err(error) = validate_deploy_params(&params) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error","error":error})),
+        )
+            .into_response();
+    }
+    let task = match state.ansible.create("deploy", &params.hostname).await {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status":"error","error":e})),
+            )
+                .into_response();
+        }
+    };
+    let id = task.clone();
     tokio::spawn(async move {
-        execute_deployment(engine, state_clone, tid, params).await;
+        execute_deployment(state, id, params).await;
     });
-
     (
         StatusCode::ACCEPTED,
-        Json(DeployTriggerResponse {
-            task_id,
-            status: "running".to_string(),
-        }),
+        Json(json!({"task_id":task,"status":"queued"})),
     )
+        .into_response()
 }
-
 pub async fn get_task_events_handler(
     _auth: crate::RequireAuth,
     State(state): State<Arc<crate::AppState>>,
-    AxPath(task_id): AxPath<String>,
-) -> impl IntoResponse {
-    let events = state.ansible.get_events(&task_id).await;
-    Json(events)
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if state.ansible.get(&id).await.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Unknown job".into()));
+    }
+    Ok(Json(json!(state.ansible.get_events(&id).await)))
 }
-
 pub async fn ws_task_stream_handler(
+    _auth: crate::RequireAuth,
     State(state): State<Arc<crate::AppState>>,
-    AxPath(task_id): AxPath<String>,
+    Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_task_ws(socket, task_id, state.ansible.clone()))
+    if state.ansible.get(&id).await.is_none() {
+        return (StatusCode::NOT_FOUND, "Unknown job").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_task_ws(socket, id, state.ansible.clone()))
 }
-
-async fn handle_task_ws(mut socket: WebSocket, task_id: String, engine: Arc<AnsibleEngine>) {
-    // First send any historical events for this task
-    let past_events = engine.get_events(&task_id).await;
-    for ev in past_events {
-        if let Ok(msg) = serde_json::to_string(&ev) {
-            let _ = socket.send(Message::Text(msg.into())).await;
+async fn handle_task_ws(mut socket: WebSocket, id: String, engine: Arc<AnsibleEngine>) {
+    let mut receiver = engine.subscribe();
+    let mut last = 0;
+    for event in engine.get_events(&id).await {
+        last = event.sequence;
+        if socket
+            .send(Message::Text(json!(event).to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
         }
     }
-
-    // Subscribe to live events
-    let mut rx = engine.subscribe();
-    while let Ok(ev) = rx.recv().await {
-        if ev.task_id == task_id {
-            if let Ok(msg) = serde_json::to_string(&ev) {
-                if let Err(_) = socket.send(Message::Text(msg.into())).await {
+    if engine.get(&id).await.is_some_and(|j| {
+        matches!(
+            j.status.as_str(),
+            "succeeded" | "failed" | "interrupted" | "cancelled"
+        )
+    }) {
+        return;
+    }
+    loop {
+        let received =
+            tokio::select! { result = receiver.recv() => result, _ = socket.recv() => break };
+        match received {
+            Ok(event) if event.task_id == id && event.sequence > last => {
+                last = event.sequence;
+                if socket
+                    .send(Message::Text(json!(event).to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if matches!(
+                    event.step.as_str(),
+                    "COMPLETE" | "FAILED" | "INTERRUPTED" | "CANCELLED"
+                ) {
                     break;
                 }
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                for event in engine
+                    .get_events(&id)
+                    .await
+                    .into_iter()
+                    .filter(|e| e.sequence > last)
+                    .collect::<Vec<_>>()
+                {
+                    last = event.sequence;
+                    if socket
+                        .send(Message::Text(json!(event).to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(_) => break,
+            _ => {}
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_structured_volumes_and_static_networks() {
+        let mp = MountPointParam {
+            host: None,
+            storage: Some("local-lvm".into()),
+            size_gb: Some(8),
+            container: "/data".into(),
+            ro: false,
+        };
+        assert_eq!(mp.spec().unwrap(), "local-lvm:8,mp=/data,backup=1");
+        assert!(validate_ip("192.168.1.4/24").is_ok());
+        assert!(validate_ip("192.168.1.4/99").is_err());
+        assert!(validate_ip("bad").is_err());
+        assert!(disk_gb("8G,mp=/evil").is_err());
+        let bad = MountPointParam {
+            container: "/data/../etc".into(),
+            ..mp
+        };
+        assert!(bad.spec().is_err());
     }
 }

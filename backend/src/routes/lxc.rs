@@ -24,7 +24,7 @@ pub async fn get_lxcs(
 
     if let Some(data) = resources["data"].as_array() {
         for item in data {
-            if item["type"] == "lxc" || item["type"] == "qemu" {
+            if item["type"] == "lxc" {
                 let id = item["vmid"].as_i64().unwrap_or(0);
                 let name = item["name"].as_str().unwrap_or("unknown");
                 let status = item["status"].as_str().unwrap_or("stopped");
@@ -40,7 +40,7 @@ pub async fn get_lxcs(
                     "mem": format!("{} MB", mem),
                     "cpu": format!("{:.1}%", cpu),
                     "tags": tags,
-                    "type": vm_type
+                    "type": vm_type, "node": item["node"]
                 }));
             }
         }
@@ -53,11 +53,25 @@ pub async fn start_lxc_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.start_lxc(&node, vmid).await {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -65,11 +79,25 @@ pub async fn stop_lxc_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.stop_lxc(&node, vmid).await {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -77,12 +105,29 @@ pub async fn get_snapshots_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.get_snapshots(&node, vmid).await {
-        Ok(data) => Json(data),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(data) => Ok(Json(data)),
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
+}
+
+fn valid_snapname(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    name.len() <= 64
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 #[derive(serde::Deserialize)]
@@ -96,16 +141,36 @@ pub async fn create_snapshot_handler(
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
     Json(payload): Json<CreateSnapshotReq>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    if !valid_snapname(&payload.snapname) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid snapshot name".into(),
+        ));
+    }
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     let desc = payload.description.unwrap_or_default();
     match state
         .proxmox
         .create_snapshot(&node, vmid, &payload.snapname, &desc)
         .await
     {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -113,15 +178,35 @@ pub async fn rollback_snapshot_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((vmid, snapname)): Path<(u32, String)>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    if !valid_snapname(&snapname) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid snapshot name".into(),
+        ));
+    }
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state
         .proxmox
         .rollback_snapshot(&node, vmid, &snapname)
         .await
     {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -129,11 +214,31 @@ pub async fn delete_snapshot_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((vmid, snapname)): Path<(u32, String)>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    if !valid_snapname(&snapname) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid snapshot name".into(),
+        ));
+    }
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.delete_snapshot(&node, vmid, &snapname).await {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -141,13 +246,40 @@ pub async fn restart_lxc_handler(
     _auth: RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
-) -> Json<Value> {
-    let node = state.default_node.clone();
-    let _ = state.proxmox.stop_lxc(&node, vmid).await;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let _operation = crate::workloads::mutation_guard(&state, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    let stopped = state
+        .proxmox
+        .stop_lxc(&node, vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    state
+        .proxmox
+        .wait_response_task(&node, stopped)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    state
+        .proxmox
+        .wait_lxc_status(&node, vmid, "stopped")
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.start_lxc(&node, vmid).await {
-        Ok(_) => Json(json!({"status": "ok"})),
-        Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+        Ok(result) => {
+            state
+                .proxmox
+                .wait_response_task(&node, result)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+            Ok(Json(json!({"status":"ok"})))
+        }
+        Err(e) => Err((axum::http::StatusCode::BAD_GATEWAY, e)),
     }
 }
 
@@ -156,7 +288,11 @@ pub async fn rrddata_lxc_handler(
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let node = state.default_node.clone();
+    let node = state
+        .proxmox
+        .resolve_lxc_node(vmid)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     match state.proxmox.get_rrddata(&node, Some(vmid), "hour").await {
         Ok(data) => Ok(Json(data)),
         Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e)),
@@ -190,7 +326,15 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
         }
     };
 
-    let node = state.default_node.clone();
+    let node = match state.proxmox.resolve_lxc_node(vmid).await {
+        Ok(node) => node,
+        Err(e) => {
+            let _ = socket
+                .send(Message::Text(format!("{}\r\n", e).into()))
+                .await;
+            return;
+        }
+    };
     let (ticket, port) = match state.proxmox.create_termproxy(&node, vmid).await {
         Ok((t, p)) => (t, p),
         Err(e) => {
@@ -203,15 +347,24 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
         }
     };
 
-    let host = state.proxmox.get_host();
-    let safe_ticket = ticket
-        .replace(":", "%3A")
-        .replace("=", "%3D")
-        .replace("/", "%2F");
-    let ws_url = format!(
-        "wss://{}:8006/api2/json/nodes/{}/lxc/{}/vncwebsocket?port={}&vncticket={}",
-        host, node, vmid, port, safe_ticket
-    );
+    let port: u16 = match port.parse() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            let _ = socket
+                .send(Message::Text("Invalid console port".into()))
+                .await;
+            return;
+        }
+    };
+    let ws_url = match state.proxmox.console_url(&node, vmid, port, &ticket) {
+        Ok(url) => url,
+        Err(_) => {
+            let _ = socket
+                .send(Message::Text("Invalid console URL".into()))
+                .await;
+            return;
+        }
+    };
 
     use native_tls::TlsConnector;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -221,6 +374,22 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
     if state.proxmox.is_insecure() {
         builder.danger_accept_invalid_certs(true);
         builder.danger_accept_invalid_hostnames(true);
+    }
+    if let Ok(path) = std::env::var("PROXMOX_CA_CERT") {
+        match std::fs::read(path)
+            .ok()
+            .and_then(|pem| native_tls::Certificate::from_pem(&pem).ok())
+        {
+            Some(cert) => {
+                builder.add_root_certificate(cert);
+            }
+            None => {
+                let _ = socket
+                    .send(Message::Text("Invalid Proxmox CA certificate".into()))
+                    .await;
+                return;
+            }
+        }
     }
     let connector = match builder.build() {
         Ok(c) => Connector::NativeTls(c),
@@ -243,8 +412,8 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
     };
 
     request.headers_mut().insert(
-        "Cookie",
-        format!("PVEAuthCookie={}", ticket).parse().unwrap(),
+        "Authorization",
+        state.proxmox.auth_header().parse().unwrap(),
     );
 
     let (proxmox_ws, _) =
@@ -264,12 +433,12 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
     let (mut client_sender, mut client_receiver) = socket.split();
 
     // Authenticate with termproxy
-    let auth_msg = format!("root@pam:{}\n", ticket);
+    let auth_msg = format!("{}:{}\n", state.proxmox.auth_user(), ticket);
     let _ = px_sender
         .send(tokio_tungstenite::tungstenite::Message::Text(auth_msg))
         .await;
 
-    let client_to_proxmox = tokio::spawn(async move {
+    let mut client_to_proxmox = tokio::spawn(async move {
         while let Some(Ok(msg)) = client_receiver.next().await {
             match msg {
                 Message::Text(t) => {
@@ -287,7 +456,7 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
         }
     });
 
-    let proxmox_to_client = tokio::spawn(async move {
+    let mut proxmox_to_client = tokio::spawn(async move {
         while let Some(Ok(msg)) = px_receiver.next().await {
             match msg {
                 tokio_tungstenite::tungstenite::Message::Text(t) => {
@@ -302,7 +471,26 @@ async fn handle_log_socket(mut socket: WebSocket, vmid_str: String, state: Arc<A
     });
 
     tokio::select! {
-        _ = client_to_proxmox => {},
-        _ = proxmox_to_client => {},
+        _ = &mut client_to_proxmox => { proxmox_to_client.abort(); },
+        _ = &mut proxmox_to_client => { client_to_proxmox.abort(); },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_snapname;
+
+    #[test]
+    fn test_snapname_validation() {
+        assert!(valid_snapname("nightly"));
+        assert!(valid_snapname("backup_2024.01"));
+        assert!(!valid_snapname(""));
+        assert!(!valid_snapname("."));
+        assert!(!valid_snapname(".."));
+        assert!(!valid_snapname("../escape"));
+        assert!(!valid_snapname(".hidden"));
+        assert!(!valid_snapname("-dash"));
+        assert!(!valid_snapname("a b"));
+        assert!(!valid_snapname(&"x".repeat(65)));
     }
 }

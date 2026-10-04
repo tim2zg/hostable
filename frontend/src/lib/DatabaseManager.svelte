@@ -1,262 +1,41 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { apiGet, apiPost } from './api';
-
-  let tables: string[] = [];
-  let sqlQuery = "";
-  let isExecuting = false;
-  let statusMessage = "";
-  let statusType: 'success' | 'error' | '' = '';
-  let rowsAffected: number | null = null;
-
-  async function fetchSchema() {
-    try {
-      const data = await apiGet('/db/schema');
-      if (data.status === 'ok' || data.status === 'mock') {
-          tables = data.tables || [];
-        }
-    } catch (err) {
-      console.error(err);
-      statusMessage = "Network error loading database schema.";
-      statusType = 'error';
-    }
-  }
-
-  async function executeSQL() {
-    if (!sqlQuery.trim()) return;
-    isExecuting = true;
-    statusMessage = "";
-    statusType = '';
-    rowsAffected = null;
-
-    try {
-      const data = await apiPost('/db/execute', { sql: sqlQuery });
-
-      if (data.status === 'ok') {
-          statusMessage = "Query executed successfully!";
-          statusType = 'success';
-          rowsAffected = data.rows_affected;
-          fetchSchema(); // Refresh tables list in case they created/dropped a table
-        } else if (data.status === 'mock') {
-          statusMessage = `Mock Mode: query would execute successfully. (${data.message})`;
-          statusType = 'success';
-        }
-    } catch (err) {
-      statusMessage = "Error: " + err;
-      statusType = 'error';
-    } finally {
-      isExecuting = false;
-    }
-  }
-
-  function selectTemplate(tableName: string) {
-    sqlQuery = `SELECT * FROM ${tableName} LIMIT 10;`;
-  }
-
-  onMount(() => {
-    fetchSchema();
-  });
+  import { onMount, onDestroy } from 'svelte';
+  import { apiGet, apiPost, apiPut } from './api';
+  import { infrastructure, watchJob, type Infrastructure, type TaskEvent } from './jobs';
+  let instances: any[] = []; let selected: any = null; let apps: any[] = []; let backups: any[] = []; let activeApp: any = null;
+  let infra: Infrastructure = {nodes:[],root:[],templates:[],bridges:[]}; let templates: any[] = [];
+  let creating = false; let name = ''; let node = ''; let storage = ''; let bridge = ''; let template = ''; let ip = ''; let gateway = ''; let size = 16;
+  let cidrs = ''; let interval = 24; let retention = 7; let appName = ''; let username = ''; let error = ''; let busy = false;
+  let credentials: any = null; let task = ''; let jobStatus = ''; let events: TaskEvent[] = []; let cancel: (() => void) | undefined;
+  let restoring: any = null; let target = ''; let restoreName = ''; let restoreUser = '';
+  const access = () => cidrs.split(/[\s,]+/).filter(Boolean);
+  async function refresh() { try { instances = await apiGet('/databases'); error = ''; } catch(e: any) { error = e.message; } }
+  async function discover() { try { infra = await infrastructure(node); node ||= infra.defaultNode || infra.nodes[0] || ''; storage = infra.root[0] || ''; bridge = infra.bridges[0] || ''; templates = (await apiGet('/node/templates?node=' + encodeURIComponent(node))).filter((t: any) => /debian-(12|13)-/.test(t.volid)); template = templates[0]?.volid || ''; } catch(e: any) { error = e.message; } }
+  async function select(instance: any) { credentials = null; activeApp = null; backups = []; try { selected = await apiGet('/databases/' + instance.id); apps = await apiGet('/databases/' + instance.id + '/apps'); cidrs = selected.allowed_cidrs.join('\n'); interval = selected.backup_interval_hours; retention = selected.retention_count; error = ''; } catch(e: any) { error = e.message; } }
+  function monitor(id: string) { cancel?.(); task = id; jobStatus = 'queued'; events = []; cancel = watchJob(id,(ev,status) => { events = ev; jobStatus = status; if (['succeeded','failed','interrupted'].includes(status)) { void refresh(); if (selected) void select(selected); } }); }
+  async function perform(action: () => Promise<void>) { error = ''; busy = true; try { await action(); } catch(e: any) { error = e.message; } finally { busy = false; } }
+  async function create() { await perform(async () => { const r = await apiPost('/databases',{name,node,ostemplate:template,storage,bridge,ip_address:ip,gateway:gateway || null,data_size_gb:size,allowed_cidrs:access(),backup_interval_hours:interval,retention_count:retention}); creating = false; monitor(r.task_id); await refresh(); }); }
+  async function addApp() { await perform(async () => { await apiPost('/databases/' + selected.id + '/apps',{name:appName,username}); appName = ''; username = ''; await select(selected); }); }
+  async function reveal(app: any) { await perform(async () => { credentials = await apiPost('/databases/apps/' + app.id + '/credentials',{}); activeApp = app; backups = await apiGet('/databases/apps/' + app.id + '/backups'); }); }
+  async function showBackups(app: any) { await perform(async () => { activeApp = app; credentials = null; backups = await apiGet('/databases/apps/' + app.id + '/backups'); }); }
+  async function backup(app: any) { await perform(async () => { const r = await apiPost('/databases/apps/' + app.id + '/backups',{}); monitor(r.task_id); }); }
+  async function rotate(app: any) { if (!confirm('Rotate this password? Update applications with the new credential afterwards.')) return; await perform(async () => { await apiPost('/databases/apps/' + app.id + '/rotate',{}); await reveal(app); }); }
+  async function revoke(app: any) { if (!confirm('Revoke new connections for ' + app.name + '? Its data is preserved.')) return; await perform(async () => { await apiPost('/databases/apps/' + app.id + '/revoke',{}); credentials = null; await select(selected); }); }
+  async function retire() { if (!confirm('Stop and retire this database instance? Its LXC, data volume and backups will be retained.')) return; await perform(async () => { await apiPost('/databases/' + selected.id + '/retire',{}); await refresh(); await select(selected); }); }
+  async function saveAccess() { await perform(async () => { selected = await apiPut('/databases/' + selected.id + '/access',{allowed_cidrs:access(),backup_interval_hours:interval,retention_count:retention}); }); }
+  async function restore() { await perform(async () => { const r = await apiPost('/databases/backups/' + restoring.id + '/restore',{target_instance_id:target,name:restoreName,username:restoreUser}); restoring = null; monitor(r.task_id); }); }
+  function downloadCertificate() { const a = document.createElement('a'); const url = URL.createObjectURL(new Blob([credentials.ca_certificate],{type:'application/x-pem-file'})); a.href = url; a.download = 'hostable-database.crt'; a.click(); URL.revokeObjectURL(url); }
+  onMount(() => { void refresh(); void discover(); }); onDestroy(() => cancel?.());
 </script>
-
-<style>
-  .db-container {
-    display: grid;
-    grid-template-columns: 240px 1fr;
-    gap: 1.5rem;
-    height: calc(100vh - 12rem);
-    background: #0f172a;
-    color: #e2e8f0;
-  }
-
-  @media (max-width: 800px) {
-    .db-container {
-      grid-template-columns: 1fr;
-      height: auto;
-    }
-  }
-
-  .flat-sidebar {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.2rem;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    overflow-y: auto;
-  }
-
-  .flat-sidebar h3 {
-    font-size: 1.1rem;
-    color: #38bdf8;
-    margin-bottom: 0.5rem;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 0.5rem;
-    font-weight: 500;
-  }
-
-  .table-item {
-    padding: 0.6rem 0.8rem;
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: monospace;
-    font-size: 0.9rem;
-    color: #cbd5e1;
-    transition: all 0.2s ease;
-    text-align: left;
-  }
-
-  .table-item:hover {
-    border-color: #38bdf8;
-    background: #1e293b;
-    color: #38bdf8;
-  }
-
-  .main-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 1.2rem;
-    overflow-y: auto;
-  }
-
-  .flat-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-  }
-
-  .flat-card h2 {
-    font-size: 1.3rem;
-    color: #f8fafc;
-    font-weight: 600;
-  }
-
-  .sql-textarea {
-    width: 100%;
-    min-height: 140px;
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    color: #e2e8f0;
-    font-family: monospace;
-    padding: 1rem;
-    font-size: 0.95rem;
-    resize: vertical;
-    outline: none;
-  }
-
-  .sql-textarea:focus {
-    border-color: #38bdf8;
-  }
-
-  .action-bar {
-    display: flex;
-    justify-content: flex-end;
-    gap: 1rem;
-  }
-
-  .flat-btn-primary {
-    background: #38bdf8;
-    color: #0f172a;
-    font-weight: 600;
-    border: none;
-    border-radius: 6px;
-    padding: 0.6rem 1.5rem;
-    cursor: pointer;
-    font-size: 0.95rem;
-    transition: background 0.2s;
-  }
-
-  .flat-btn-primary:hover:not(:disabled) {
-    background: #0ea5e9;
-  }
-
-  .flat-btn-primary:disabled {
-    background: #475569;
-    color: #94a3b8;
-    cursor: not-allowed;
-  }
-
-  .banner {
-    padding: 0.8rem 1rem;
-    border-radius: 6px;
-    font-size: 0.95rem;
-    font-weight: 500;
-  }
-
-  .banner.success {
-    background: rgba(34, 197, 94, 0.15);
-    border: 1px solid #22c55e;
-    color: #4ade80;
-  }
-
-  .banner.error {
-    background: rgba(239, 68, 68, 0.15);
-    border: 1px solid #ef4444;
-    color: #f87171;
-  }
-
-  .no-tables {
-    font-size: 0.9rem;
-    color: #64748b;
-    text-align: center;
-    padding: 1rem 0;
-  }
-</style>
-
-<div class="db-container animate-fade-in">
-  <!-- Left Side: Table List Browser -->
-  <aside class="flat-sidebar">
-    <h3>Active Tables</h3>
-    {#if tables.length === 0}
-      <div class="no-tables">No public tables found</div>
-    {:else}
-      {#each tables as table}
-        <button class="table-item" on:click={() => selectTemplate(table)}>
-          📁 {table}
-        </button>
-      {/each}
-    {/if}
-  </aside>
-
-  <!-- Right Side: SQL Executor -->
-  <main class="main-panel">
-    <div class="flat-card">
-      <h2>Database Provisioning Console</h2>
-      <p style="color: #94a3b8; font-size: 0.9rem;">
-        Direct database query execution panel. Destructive commands targeting Hostable's core tables (`users`, `proxy_rules`) are automatically blocked for security.
-      </p>
-
-      <textarea
-        class="sql-textarea"
-        placeholder="-- e.g. CREATE TABLE app_config (id SERIAL PRIMARY KEY, domain TEXT);\nSELECT * FROM pg_tables WHERE schemaname = 'public';"
-        bind:value={sqlQuery}
-      ></textarea>
-
-      <div class="action-bar">
-        <button class="flat-btn-primary" on:click={executeSQL} disabled={isExecuting || !sqlQuery.trim()}>
-          {isExecuting ? 'Executing...' : 'Run Query'}
-        </button>
-      </div>
-
-      {#if statusMessage}
-        <div class="banner {statusType}">
-          {statusMessage}
-        </div>
-      {/if}
-
-      {#if rowsAffected !== null}
-        <div style="font-family: monospace; font-size: 0.9rem; color: #38bdf8;">
-          Rows affected: {rowsAffected}
-        </div>
-      {/if}
-    </div>
-  </main>
-</div>
+<div class="platform"><h1>Databases</h1><p class="intro">Host PostgreSQL on a dedicated LXC with a persistent data volume. Connect your own applications directly using separate credentials and TLS.</p>
+<button on:click={refresh}>Refresh</button><button class="secondary" on:click={() => { creating = !creating; selected = null; cidrs = ''; }}>Create instance</button>{#if error}<p class="error" role="alert">{error}</p>{/if}
+{#if creating}<form class="panel" on:submit|preventDefault={create}><h2>New PostgreSQL instance</h2><p class="muted">Download a Debian 12 or 13 standard template in Proxmox first. The manager needs SSH and PostgreSQL access to the guest.</p><div class="fields">
+<label>Name<input bind:value={name} required /></label><label>Node<select bind:value={node} on:change={discover} required>{#each infra.nodes as n}<option>{n}</option>{/each}</select></label><label>OS template<select bind:value={template} required>{#each templates as t}<option value={t.volid}>{t.volid}</option>{/each}</select></label><label>Storage pool<select bind:value={storage} required>{#each infra.root as s}<option>{s}</option>{/each}</select></label><label>Data volume (GiB)<input type="number" min="1" bind:value={size} required /></label><label>Bridge<select bind:value={bridge} required>{#each infra.bridges as b}<option>{b}</option>{/each}</select></label><label>Stable IP / CIDR<input bind:value={ip} required placeholder="192.168.1.30/24" /></label><label>Gateway<input bind:value={gateway} placeholder="192.168.1.1" /></label></div><label>Allowed application networks (CIDRs)<textarea bind:value={cidrs} required placeholder="192.168.1.0/24"></textarea></label><div class="fields"><label>Backup interval hours (0 disables)<input type="number" min="0" max="8760" bind:value={interval} /></label><label>Backups to retain<input type="number" min="1" max="100" bind:value={retention} /></label></div><button disabled={busy || !template}>Provision database</button></form>{/if}
+<div class="cards">{#each instances as instance}<div class="panel"><h2>{instance.name}</h2><span class="badge">{instance.status}</span><p>{instance.host}:{instance.port} · LXC {instance.vmid || 'pending'} on {instance.node}</p><p class="muted">{instance.data_size_gb} GiB on {instance.storage}</p>{#if instance.error}<p class="error">{instance.error}</p>{/if}<button class="secondary" on:click={() => { creating = false; void select(instance); }}>Manage</button><button class="secondary" on:click={() => monitor(instance.task_id)}>Provisioning job</button></div>{/each}</div>
+{#if selected}<div class="panel"><h2>{selected.name}</h2><p>SQL connection: {selected.connection_ready ? 'verified' : 'unavailable'}</p><p class="muted">Data volume: {selected.data_volume || 'not recorded yet'}</p><p>TLS: {selected.tls_mode}</p>{#if selected.tls_mode==='managed_ca'}<button class="secondary" disabled={busy} on:click={() => perform(async () => { const r = await apiPost('/databases/'+selected.id+'/certificate/renew',{}); monitor(r.task_id); })}>Renew database certificate</button>{/if}
+<h3>Application databases</h3><div class="scroll"><table><thead><tr><th>Database / user</th><th>Last backup</th><th>Actions</th></tr></thead><tbody>{#each apps as app}<tr><td>{app.name} / {app.username}{#if app.status}<br />{app.status}{/if}</td><td>{app.last_backup_at ? new Date(app.last_backup_at * 1000).toLocaleString() : 'None'}{#if app.last_backup_error}<p class="error">{app.last_backup_error}</p>{/if}</td><td><button class="secondary" disabled={busy} on:click={() => showBackups(app)}>Backups</button><button disabled={busy || selected.status !== 'ready' || app.status !== 'ready'} on:click={() => reveal(app)}>Connection / backups</button><button disabled={busy || selected.status !== 'ready' || app.status !== 'ready'} on:click={() => backup(app)}>Back up</button><button class="secondary" disabled={busy || selected.status !== 'ready' || !['ready','revoked','rotating','rotation_interrupted'].includes(app.status)} on:click={() => rotate(app)}>Rotate password</button><button class="danger" disabled={busy || selected.status !== 'ready' || !['ready','revoked'].includes(app.status)} on:click={() => revoke(app)}>Revoke login</button></td></tr>{/each}</tbody></table></div>
+{#if selected.status === 'ready'}<form on:submit|preventDefault={addApp}><div class="fields"><label>New database<input bind:value={appName} pattern="[a-z][a-z0-9_]*" required /></label><label>Dedicated username<input bind:value={username} pattern="[a-z][a-z0-9_]*" required /></label></div><button disabled={busy}>Create application database</button></form><h3>Access and scheduled backups</h3><form on:submit|preventDefault={saveAccess}><label>Allowed client CIDRs<textarea bind:value={cidrs} required></textarea></label><div class="fields"><label>Backup interval hours<input type="number" min="0" max="8760" bind:value={interval} /></label><label>Retention count<input type="number" min="1" max="100" bind:value={retention} /></label></div><button disabled={busy}>Apply settings</button><button type="button" class="danger" disabled={busy} on:click={retire}>Retire and preserve data</button></form>{/if}</div>{/if}
+{#if credentials && activeApp}<div class="panel"><h2>Connection: {activeApp.name}</h2><p>Save the trusted certificate and configure your client with sslmode=verify-full and sslrootcert pointing to it.</p><pre>{credentials.uri}</pre><div class="fields"><label>Username<input readonly value={credentials.username} /></label><label>Password<input readonly type="password" value={credentials.password} /></label></div><button on:click={downloadCertificate}>Download TLS certificate</button><button class="secondary" on:click={() => credentials = null}>Hide credentials</button><h3>Backups</h3>{#each backups as b}<p>{new Date(b.created_at*1000).toLocaleString()} · {Math.round(b.bytes/1024)} KiB · {b.encrypted ? 'encrypted' : 'unencrypted'} · {b.id} <button class="secondary" on:click={() => { restoring = b; target = ''; restoreName = ''; restoreUser = ''; }}>Restore into new database</button></p>{/each}{#if !backups.length}<p class="muted">No successful backups yet.</p>{/if}</div>{/if}
+{#if activeApp && !credentials}<div class="panel"><h2>Backups: {activeApp.name}</h2>{#each backups as b}<p>{new Date(b.created_at*1000).toLocaleString()} · {Math.round(b.bytes/1024)} KiB · {b.encrypted ? 'encrypted' : 'unencrypted'} · {b.id} <button class="secondary" on:click={() => { restoring = b; target = ''; restoreName = ''; restoreUser = ''; }}>Restore into new database</button></p>{/each}{#if !backups.length}<p class="muted">No successful backups yet.</p>{/if}</div>{/if}
+{#if restoring}<form class="panel" on:submit|preventDefault={restore}><h2>Restore into a new database</h2><p class="muted">Existing data is never overwritten. Choose a separate instance for recovery verification.</p><div class="fields"><label>Target instance<select bind:value={target} required><option value="">Select an instance</option>{#each instances.filter(i => i.status === 'ready') as i}<option value={i.id}>{i.name}</option>{/each}</select></label><label>New database name<input required bind:value={restoreName} pattern="[a-z][a-z0-9_]*" /></label><label>New username<input required bind:value={restoreUser} pattern="[a-z][a-z0-9_]*" /></label></div><button disabled={busy}>Restore backup</button></form>{/if}
+{#if task}<div class="panel"><h2>Operation: {jobStatus}</h2><code>{task}</code><pre>{events.map(e => '['+e.step+'] '+e.message).join('\n')}</pre></div>{/if}</div>

@@ -22,7 +22,7 @@
 
   let status: GatewayStatus = {
     connected: false,
-    gateway_url: 'http://127.0.0.1:3000',
+    gateway_url: '',
     active_routes: 0,
     e2ee_mode: 'Checking...',
   };
@@ -69,7 +69,7 @@
         target_port: Number(newTargetPort),
         service_name: newServiceName || newDomain.split('.')[0],
         vmid: Number(newVmid),
-        mode: 'zero-trust',
+        mode: 'https',
       });
       toasts.add(`Route for ${newDomain} registered successfully!`, 'success');
       showAddModal = false;
@@ -106,7 +106,7 @@
     <div>
       <h1 class="page-title">🛡️ SecureWeb Gateway</h1>
       <p class="page-subtitle">
-        Zero-Trust Post-Quantum E2EE Gateway integration. Seamlessly exposes Hostable LXCs without custom reverse proxies.
+        Manage HTTP ingress through your configured external gateway.
       </p>
     </div>
     <div class="actions">
@@ -127,7 +127,7 @@
         {#if status.connected}
           <span class="badge badge-success">🟢 Connected</span>
         {:else}
-          <span class="badge badge-warning">🟡 Standalone / Fallback</span>
+          <span class="badge badge-warning">🟡 Unavailable / Unconfigured</span>
         {/if}
       </div>
     </div>
@@ -138,13 +138,13 @@
     </div>
 
     <div class="status-item">
-      <div class="status-label">Encryption Profile</div>
+      <div class="status-label">Gateway TLS</div>
       <div class="status-value">{status.e2ee_mode}</div>
     </div>
 
     <div class="status-item">
-      <div class="status-label">Protected Services</div>
-      <div class="status-value bold">{routes.length} Active</div>
+      <div class="status-label">Configured Services</div>
+      <div class="status-value bold">{status.active_routes} confirmed while connected</div>
     </div>
   </div>
 
@@ -167,7 +167,7 @@
               <th>Public Domain</th>
               <th>Internal Upstream</th>
               <th>VMID</th>
-              <th>Security Mode</th>
+              <th>Ingress mode</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -200,10 +200,11 @@
 
   <!-- Modal for manual route -->
   {#if showAddModal}
-    <div class="modal-backdrop" on:click|self={() => showAddModal = false}>
+    <div class="modal-backdrop">
+      <button class="modal-dismiss" aria-label="Close route dialog" on:click={() => showAddModal = false}></button>
       <div class="modal-content">
         <h3>Register New SecureWeb Ingress Route</h3>
-        <p class="modal-desc">Routes HTTPS traffic through SecureWeb Gateway's WAF and Zero-Trust E2EE router to your LXC.</p>
+        <p class="modal-desc">Configure the external gateway to forward HTTPS traffic to this container.</p>
 
         <div class="form-grid">
           <div class="form-group">
@@ -245,6 +246,8 @@
 </div>
 
 <style>
+  .modal-dismiss { position: absolute; inset: 0; border: 0; background: transparent; }
+  .modal-content { position: relative; }
   .secureweb-view {
     max-width: 1100px;
     margin: 0 auto;

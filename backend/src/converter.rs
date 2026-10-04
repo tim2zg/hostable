@@ -19,187 +19,86 @@ pub async fn convert_dockerfile_endpoint(
     (StatusCode::OK, Json(ConvertResponse { yaml }))
 }
 
-#[derive(Deserialize)]
-pub struct DeployRequest {
-    pub image: String,
-    pub hostname: String,
-    pub vmid: u32,
-    pub memory: String,
-    pub template_storage: String,
-    pub rootfs_storage: String,
-    pub env_vars: Vec<String>,
-    pub volumes: Vec<String>,
-    pub use_hostable_db: bool,
-    pub db_name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct DeployResponse {
-    pub status: String,
-    pub message: String,
-}
-
-pub async fn deploy_lxc_endpoint(
-    _auth: crate::RequireAuth,
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
-    Json(payload): Json<DeployRequest>,
-) -> impl IntoResponse {
-    let _permit = match state.deployment_lock.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DeployResponse {
-                    status: "error".to_string(),
-                    message: format!("Failed to acquire deployment lock: {}", e),
-                }),
+// Compatibility routes use the same validated, durable deployment executor.
+fn canonical(mut value: serde_json::Value) -> Result<crate::ansible::AnsibleDeployParams, String> {
+    let p = value
+        .as_object_mut()
+        .ok_or("Expected a deployment object")?;
+    if p.get("use_hostable_db").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("Create a hosted application database and pass database_id; shared metadata credentials are unsupported".into());
+    }
+    if let Some(images) = p.remove("images") {
+        let images = images.as_array().ok_or("images must be an array")?;
+        if images.len() != 1 {
+            return Err(
+                "Deploy each service separately; merging multiple image filesystems is unsupported"
+                    .into(),
             );
         }
-    };
-
-    let node = state.default_node.clone();
-
-    // 1. Process DB Provisioning
-    let mut final_envs = payload.env_vars.clone();
-    if payload.use_hostable_db {
-        if let Some(db_name) = &payload.db_name {
-            if let Some(db) = &state.db {
-                let safe_db = db_name.replace("\"", "").replace("'", "");
-                let _ = db.create_database(&safe_db).await;
-
-                if let Ok(ip) = local_ip_address::local_ip() {
-                    // For now, assuming hostable connects as admin user, we will just pass the admin credentials or a dedicated user
-                    let db_url = format!(
-                        "postgres://postgres:postgres@{}:5432/{}",
-                        ip.to_string(),
-                        safe_db
-                    );
-                    final_envs.push(format!("DATABASE_URL={}", db_url));
-                }
-            }
+        p.insert("image".into(), images[0].clone());
+    }
+    if let Some(memory) = p.get("memory").and_then(|v| v.as_str()) {
+        let n: u32 = memory
+            .parse()
+            .map_err(|_| "memory must be an integer in MiB")?;
+        p.insert("memory".into(), n.into());
+    }
+    if let Some(envs) = p.get("env_vars").and_then(|v| v.as_array()) {
+        let mut map = serde_json::Map::new();
+        for e in envs {
+            let (k, v) = e
+                .as_str()
+                .and_then(|s| s.split_once('='))
+                .ok_or("Invalid environment entry")?;
+            map.insert(k.into(), v.into());
         }
+        p.insert("env_vars".into(), map.into());
     }
-
-    // 2. Extract Docker Image to Proxmox Rootfs
-    let extractor = crate::oci::OciExtractor::new();
-    let cache_dir = std::path::PathBuf::from("/cache");
-    if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
-    }
-    let out_path = cache_dir.join(format!("hostable_vmid_{}.tar.xz", payload.vmid));
-    let filename = format!("hostable_vmid_{}.tar.xz", payload.vmid);
-
-    match extractor
-        .extract_to_dir(&payload.image, &out_path, Some(&final_envs), None)
-        .await
-    {
-        Ok(_) => {
-            // 3. Upload to Proxmox
-            match state
-                .proxmox
-                .upload_template(&node, &payload.template_storage, &out_path, &filename)
-                .await
-            {
-                Ok(_) => {
-                    // Clean up local tar.xz template immediately after upload
-                    if out_path.exists() {
-                        let _ = std::fs::remove_file(&out_path);
-                    }
-                    // 4. Create LXC
-                    let mut params = std::collections::HashMap::new();
-                    params.insert("vmid".to_string(), payload.vmid.to_string());
-                    params.insert(
-                        "ostemplate".to_string(),
-                        format!("{}:vztmpl/{}", payload.template_storage, filename),
-                    );
-                    params.insert("hostname".to_string(), payload.hostname.clone());
-                    params.insert("memory".to_string(), payload.memory.clone());
-                    params.insert(
-                        "net0".to_string(),
-                        "name=eth0,bridge=vmbr0,ip=dhcp".to_string(),
-                    );
-                    params.insert("storage".to_string(), payload.rootfs_storage.clone());
-                    params.insert(
-                        "rootfs".to_string(),
-                        format!("{}:8", payload.rootfs_storage),
-                    );
-                    params.insert("tags".to_string(), "hostable".to_string());
-                    params.insert("unprivileged".to_string(), "1".to_string());
-                    params.insert("features".to_string(), "nesting=1".to_string());
-
-                    // Map Volumes
-                    for (i, vol) in payload.volumes.iter().enumerate() {
-                        let parts: Vec<&str> = vol.split(':').collect();
-                        if parts.len() == 4 && parts[0] == "storage" {
-                            // format: storage:storage_name:size_gb:container_path
-                            let storage_name = parts[1];
-                            let size_gb = parts[2];
-                            let container_path = parts[3];
-                            params.insert(
-                                format!("mp{}", i),
-                                format!("{}:{},mp={}", storage_name, size_gb, container_path),
-                            );
-                        } else if parts.len() == 3 && parts[0] == "bind" {
-                            // format: bind:host_path:container_path
-                            let host_path = parts[1];
-                            let container_path = parts[2];
-                            params.insert(
-                                format!("mp{}", i),
-                                format!("{},mp={}", host_path, container_path),
-                            );
-                        } else if parts.len() == 2 {
-                            // format: host_path:container_path (fallback/legacy)
-                            let host_path = parts[0];
-                            let container_path = parts[1];
-                            params.insert(
-                                format!("mp{}", i),
-                                format!("{},mp={}", host_path, container_path),
-                            );
-                        }
-                    }
-
-                    match state.proxmox.create_lxc(&node, payload.vmid, params).await {
-                        Ok(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                            let _ = state.proxmox.start_lxc(&node, payload.vmid).await;
-
-                            (
-                                StatusCode::OK,
-                                Json(DeployResponse {
-                                    status: "ok".to_string(),
-                                    message: format!(
-                                        "Successfully deployed {} as LXC {}",
-                                        payload.hostname, payload.vmid
-                                    ),
-                                }),
-                            )
-                        }
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(DeployResponse {
-                                status: "error".to_string(),
-                                message: format!("Create failed: {}", e),
-                            }),
-                        ),
-                    }
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(DeployResponse {
-                        status: "error".to_string(),
-                        message: format!("Upload failed: {}", e),
-                    }),
-                ),
+    if let Some(volumes) = p.remove("volumes") {
+        let mut mounts = Vec::new();
+        for vol in volumes.as_array().ok_or("volumes must be an array")? {
+            if vol.is_object() {
+                mounts.push(vol.clone());
+                continue;
             }
+            let parts: Vec<_> = vol.as_str().ok_or("Invalid volume")?.split(':').collect();
+            let mount = match parts.as_slice() {
+                ["storage", storage, size, path] => {
+                    serde_json::json!({"storage":storage,"size_gb":crate::ansible::disk_gb(size)?,"container":path})
+                }
+                ["bind", host, path] | [host, path] => {
+                    serde_json::json!({"host":host,"container":path})
+                }
+                _ => {
+                    return Err("Use structured volumes with storage, size_gb and container".into());
+                }
+            };
+            mounts.push(mount);
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(DeployResponse {
-                status: "error".to_string(),
-                message: format!("Extraction failed: {}", e),
-            }),
-        ),
+        p.insert("mountpoints".into(), mounts.into());
     }
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+pub async fn deploy_lxc_endpoint(
+    auth: crate::RequireAuth,
+    state: axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(value): Json<serde_json::Value>,
+) -> axum::response::Response {
+    match canonical(value) {
+        Ok(params) => crate::ansible::trigger_deploy_handler(auth, state, Json(params)).await,
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status":"error","error":error})),
+        )
+            .into_response(),
+    }
+}
+pub async fn deploy_stack_endpoint(
+    auth: crate::RequireAuth,
+    state: axum::extract::State<std::sync::Arc<crate::AppState>>,
+    value: Json<serde_json::Value>,
+) -> axum::response::Response {
+    deploy_lxc_endpoint(auth, state, value).await
 }
 
 pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
@@ -297,213 +196,6 @@ pub fn convert_dockerfile_to_distrobuilder(dockerfile: &str) -> String {
     }
 
     yaml
-}
-
-#[derive(Deserialize)]
-pub struct DeployStackRequest {
-    pub images: Vec<String>,
-    pub hostname: String,
-    pub vmid: u32,
-    pub memory: String,
-    pub template_storage: String,
-    pub rootfs_storage: String,
-    #[serde(default)]
-    pub env_vars: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub volumes: Vec<String>,
-}
-
-pub async fn deploy_stack_endpoint(
-    _auth: crate::RequireAuth,
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
-    Json(payload): Json<DeployStackRequest>,
-) -> impl IntoResponse {
-    let _permit = match state.deployment_lock.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DeployResponse {
-                    status: "error".to_string(),
-                    message: format!("Failed to acquire deployment lock: {}", e),
-                }),
-            );
-        }
-    };
-
-    let node = state.default_node.clone();
-
-    // Always start with Alpine as the base OS to provide OpenRC /sbin/init
-    let mut image_list = vec!["alpine:3.19".to_string()];
-    image_list.extend(payload.images.clone());
-
-    let mut extra_files = std::collections::HashMap::new();
-    let extractor = crate::oci::OciExtractor::new();
-
-    // Generate OpenRC scripts for each app dynamically from their OCI Config Blob
-    for (idx, img_str) in payload.images.iter().enumerate() {
-        let app_name = format!("app-{}", idx);
-
-        let mut script_content = String::new();
-        script_content.push_str("#!/bin/sh\n");
-        script_content.push_str(&format!("echo 'Starting {}...'\n", img_str));
-
-        // Inject user provided Env Vars
-        for (k, v) in &payload.env_vars {
-            script_content.push_str(&format!("export {}=\"{}\"\n", k, v.replace("\"", "\\\"")));
-        }
-
-        // Fetch OCI Config Blob
-        if let Ok(config) = extractor.get_image_config(img_str).await {
-            // Inject Image Default Env Vars
-            for env in config.env {
-                if let Some((k, v)) = env.split_once('=') {
-                    // Do not override user vars
-                    if !payload.env_vars.contains_key(k) {
-                        script_content.push_str(&format!(
-                            "export {}=\"{}\"\n",
-                            k,
-                            v.replace("\"", "\\\"")
-                        ));
-                    }
-                }
-            }
-
-            if !config.working_dir.is_empty() {
-                script_content.push_str(&format!("cd {}\n", config.working_dir));
-            }
-
-            let mut run_cmd = String::new();
-            if let Some(entrypoint) = config.entrypoint {
-                run_cmd.push_str(&entrypoint.join(" "));
-            }
-            if let Some(cmd) = config.cmd {
-                if !run_cmd.is_empty() {
-                    run_cmd.push(' ');
-                }
-                run_cmd.push_str(&cmd.join(" "));
-            }
-
-            if run_cmd.is_empty() {
-                run_cmd = "sh".to_string(); // Fallback
-            }
-
-            // Execute in background so the script completes and OpenRC continues
-            script_content.push_str(&format!(
-                "nohup {} > /var/log/{}.log 2>&1 &\n",
-                run_cmd, app_name
-            ));
-        } else {
-            script_content.push_str("echo 'Failed to fetch OCI Config!'\n");
-        }
-
-        extra_files.insert(format!("etc/local.d/{}.start", app_name), script_content);
-    }
-
-    // Enable local service in OpenRC
-    extra_files.insert(
-        "etc/runlevels/default/local".to_string(),
-        "symlink:/etc/init.d/local".to_string(),
-    ); // Symlink hack needs to be processed!
-
-    let cache_dir = std::path::PathBuf::from("/cache");
-    if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
-    }
-    let out_path = cache_dir.join(format!("hostable_stack_{}.tar.xz", payload.vmid));
-    let filename = format!("hostable_stack_{}.tar.xz", payload.vmid);
-
-    match extractor
-        .extract_multiple_to_dir(&image_list, &out_path, Some(extra_files))
-        .await
-    {
-        Ok(_) => {
-            match state
-                .proxmox
-                .upload_template(&node, &payload.template_storage, &out_path, &filename)
-                .await
-            {
-                Ok(_) => {
-                    if out_path.exists() {
-                        let _ = std::fs::remove_file(&out_path);
-                    }
-                    let mut params = std::collections::HashMap::new();
-                    params.insert("vmid".to_string(), payload.vmid.to_string());
-                    params.insert(
-                        "ostemplate".to_string(),
-                        format!("{}:vztmpl/{}", payload.template_storage, filename),
-                    );
-                    params.insert("hostname".to_string(), payload.hostname.clone());
-                    params.insert("memory".to_string(), payload.memory.clone());
-                    params.insert(
-                        "net0".to_string(),
-                        "name=eth0,bridge=vmbr0,ip=dhcp".to_string(),
-                    );
-                    params.insert("storage".to_string(), payload.rootfs_storage.clone());
-                    params.insert(
-                        "rootfs".to_string(),
-                        format!("{}:8", payload.rootfs_storage),
-                    );
-                    params.insert("tags".to_string(), "hostable,stack".to_string());
-                    params.insert("unprivileged".to_string(), "1".to_string());
-                    params.insert("features".to_string(), "nesting=1,keyctl=1".to_string());
-
-                    // Map Volumes natively to Proxmox LXC Mountpoints
-                    for (i, vol) in payload.volumes.iter().enumerate() {
-                        let parts: Vec<&str> = vol.split(':').collect();
-                        if parts.len() == 4 && parts[0] == "storage" {
-                            let storage_id = parts[1];
-                            let size = parts[2];
-                            let container_path = parts[3];
-                            params.insert(
-                                format!("mp{}", i),
-                                format!("{}:{},mp={}", storage_id, size, container_path),
-                            );
-                        }
-                    }
-
-                    match state.proxmox.create_lxc(&node, payload.vmid, params).await {
-                        Ok(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                            let _ = state.proxmox.start_lxc(&node, payload.vmid).await;
-
-                            (
-                                StatusCode::OK,
-                                Json(DeployResponse {
-                                    status: "ok".to_string(),
-                                    message: format!(
-                                        "Successfully deployed Stack {} as LXC {}",
-                                        payload.hostname, payload.vmid
-                                    ),
-                                }),
-                            )
-                        }
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(DeployResponse {
-                                status: "error".to_string(),
-                                message: format!("Create failed: {}", e),
-                            }),
-                        ),
-                    }
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(DeployResponse {
-                        status: "error".to_string(),
-                        message: format!("Upload failed: {}", e),
-                    }),
-                ),
-            }
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(DeployResponse {
-                status: "error".to_string(),
-                message: format!("Extraction failed: {}", e),
-            }),
-        ),
-    }
 }
 
 #[cfg(test)]

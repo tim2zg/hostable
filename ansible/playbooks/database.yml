@@ -1,0 +1,141 @@
+---
+- name: Configure managed PostgreSQL guest
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Add database guest
+      ansible.builtin.add_host:
+        name: managed_database
+        ansible_host: "{{ guest_ip }}"
+        ansible_user: root
+        ansible_ssh_private_key_file: "{{ ssh_key }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking={{ host_key_policy }} -o UserKnownHostsFile={{ known_hosts }} -o IdentitiesOnly=yes"
+      no_log: true
+
+- name: Install and initialize PostgreSQL
+  hosts: managed_database
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+
+    - name: Install Python for configuration
+      ansible.builtin.raw: "command -v python3 >/dev/null || (apt-get update && apt-get install -y python3)"
+      changed_when: false
+
+    - name: Install PostgreSQL and certificate tools
+      ansible.builtin.apt:
+        name: [postgresql, postgresql-client, openssl]
+        update_cache: true
+        state: present
+
+    - name: Read installed cluster version
+      ansible.builtin.shell: "set -eu; pg_lsclusters --no-header | awk 'NR == 1 { print $1 }'"
+      register: cluster_version
+      changed_when: false
+
+    - name: Check supported PostgreSQL version
+      ansible.builtin.assert:
+        that: "(cluster_version.stdout | int) >= 15"
+        fail_msg: "The database recipe requires PostgreSQL 15 or newer"
+
+    - name: Stop PostgreSQL while preparing persistent storage
+      ansible.builtin.service:
+        name: postgresql
+        state: stopped
+
+    - name: Prepare data directory
+      ansible.builtin.file:
+        path: /var/lib/hostable-postgres/data
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: Initialize empty persistent volume
+      ansible.builtin.command:
+        argv:
+          - "/usr/lib/postgresql/{{ cluster_version.stdout }}/bin/initdb"
+          - --pgdata=/var/lib/hostable-postgres/data
+          - --auth-local=peer
+          - --auth-host=scram-sha-256
+        creates: /var/lib/hostable-postgres/data/PG_VERSION
+      become: true
+      become_user: postgres
+      become_method: su
+
+    - name: Validate persistent data version
+      ansible.builtin.slurp:
+        src: /var/lib/hostable-postgres/data/PG_VERSION
+      register: data_version
+
+    - name: Refuse incompatible data directories
+      ansible.builtin.assert:
+        that: "(data_version.content | b64decode | trim) == (cluster_version.stdout | trim)"
+        fail_msg: "A PostgreSQL major upgrade requires migration; the data volume is preserved"
+
+    - name: Create server certificate directory
+      ansible.builtin.file:
+        path: /etc/hostable-postgres
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: Configure database TLS identity
+      ansible.builtin.import_tasks: ../tasks/database_tls.yml
+
+    - name: Configure PostgreSQL service
+      ansible.builtin.copy:
+        dest: "/etc/postgresql/{{ cluster_version.stdout }}/main/conf.d/hostable.conf"
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        content: |
+          data_directory = '/var/lib/hostable-postgres/data'
+          listen_addresses = '*'
+          password_encryption = 'scram-sha-256'
+          ssl = on
+          ssl_cert_file = '/etc/hostable-postgres/server.crt'
+          ssl_key_file = '/etc/hostable-postgres/server.key'
+
+    - name: Apply client access rules
+      ansible.builtin.copy:
+        dest: "/etc/postgresql/{{ cluster_version.stdout }}/main/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        content: |
+          local all postgres peer
+          hostssl all hostable_control {{ manager_cidr }} scram-sha-256
+          hostssl all +hostable_apps {{ manager_cidr }} scram-sha-256
+          {% for cidr in allowed_cidrs %}
+          hostssl all +hostable_apps {{ cidr }} scram-sha-256
+          {% endfor %}
+          host all all 0.0.0.0/0 reject
+          host all all ::/0 reject
+
+    - name: Start PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Initialize the control identity
+      ansible.builtin.command:
+        argv: [psql, --no-psqlrc, -v, ON_ERROR_STOP=1, --dbname=postgres]
+        stdin: "{{ bootstrap_sql }}"
+      become: true
+      become_user: postgres
+      become_method: su
+      when: bootstrap_sql | default('') | length > 0
+      no_log: true
+
+    - name: Export legacy public server certificate
+      when: not (managed_ca | default(false) | bool)
+      ansible.builtin.fetch:
+        src: /etc/hostable-postgres/server.crt
+        dest: "{{ certificate_path }}"
+        flat: true

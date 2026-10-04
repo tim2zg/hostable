@@ -1,0 +1,58 @@
+---
+- name: Create legacy self-signed identity
+  ansible.builtin.command:
+    argv: [openssl, req, -x509, -newkey, 'rsa:3072', -nodes, -days, '365', -keyout, /etc/hostable-postgres/server.key, -out, /etc/hostable-postgres/server.crt, -subj, '/CN={{ guest_ip }}', -addext, 'subjectAltName=IP:{{ guest_ip }}']
+    creates: /etc/hostable-postgres/server.key
+  when: not (managed_ca | default(false) | bool)
+  no_log: true
+
+- name: Create private server key
+  ansible.builtin.command:
+    argv: [openssl, genpkey, -algorithm, RSA, -pkeyopt, 'rsa_keygen_bits:3072', -out, /etc/hostable-postgres/server.key]
+    creates: /etc/hostable-postgres/server.key
+  when: managed_ca | default(false) | bool
+  no_log: true
+
+- name: Inspect leaf certificate validity
+  ansible.builtin.command:
+    argv: [openssl, x509, -noout, -checkend, '2592000', -in, /etc/hostable-postgres/server.crt]
+  register: leaf_validity
+  changed_when: false
+  failed_when: false
+  when: managed_ca | default(false) | bool
+
+- name: Renew identity using the stable manager CA
+  when: (managed_ca | default(false) | bool) and ((force_renew | default(false) | bool) or (leaf_validity.rc != 0))
+  block:
+    - name: Generate server signing request
+      ansible.builtin.command:
+        argv: [openssl, req, -new, -key, /etc/hostable-postgres/server.key, -out, /etc/hostable-postgres/server.csr, -subj, '/CN={{ guest_ip }}', -addext, 'subjectAltName=IP:{{ guest_ip }}', -addext, 'extendedKeyUsage=serverAuth']
+      no_log: true
+    - name: Fetch public signing request
+      ansible.builtin.fetch:
+        src: /etc/hostable-postgres/server.csr
+        dest: '{{ csr_path }}'
+        flat: true
+    - name: Sign a replacement certificate on the manager
+      ansible.builtin.command:
+        argv: [openssl, x509, -req, -in, '{{ csr_path }}', -CA, '{{ ca_cert }}', -CAkey, '{{ ca_key }}', -CAcreateserial, -out, '{{ leaf_path }}', -days, '365', -extfile, '{{ extension_path }}']
+      delegate_to: localhost
+      become: false
+      no_log: true
+    - name: Install signed public identity
+      ansible.builtin.copy:
+        src: '{{ leaf_path }}'
+        dest: /etc/hostable-postgres/server.crt
+        owner: postgres
+        group: postgres
+        mode: '0600'
+
+- name: Protect TLS files
+  ansible.builtin.file:
+    path: '{{ item }}'
+    owner: postgres
+    group: postgres
+    mode: '0600'
+  loop:
+    - /etc/hostable-postgres/server.key
+    - /etc/hostable-postgres/server.crt

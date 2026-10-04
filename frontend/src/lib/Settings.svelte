@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import PortalUpdates from './PortalUpdates.svelte';
 
   let tplStorage = 'local';
   let rootfsStorage = 'local-lvm';
@@ -102,4 +103,5 @@
       {/if}
     </div>
   </div>
+  <PortalUpdates />
 </div>

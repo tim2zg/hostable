@@ -7,7 +7,6 @@
 **/*.tar.xz
 **/*.cache/
 hostable-linux-amd64
-build.bat
 
 # Sensitive Configs
 .env
@@ -17,8 +16,22 @@ hostable-manager/
 # General
 .DS_Store
 .agents/
+.commandcode/
 ORIGINAL_REQUEST.md
 PROJECT.md
 TEST_INFRA.md
 TEST_READY.md
 tests_e2e/
+
+# Local runtime secrets, metadata and backups
+hostable-data/
+admin-token
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.dump
+*.key
+*.pgpass
+**/__pycache__/
+.pytest_cache/

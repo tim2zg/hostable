@@ -34,6 +34,7 @@
   .toast.success { border-left-color: #10b981; }
   .toast.error { border-left-color: #ef4444; }
   .toast.info { border-left-color: #38bdf8; }
+  .toast.warn { border-left-color: #f59e0b; }
 
   .icon {
     font-size: 1.2rem;
@@ -70,6 +71,7 @@
         {#if t.type === 'success'}✅{/if}
         {#if t.type === 'error'}❌{/if}
         {#if t.type === 'info'}ℹ️{/if}
+        {#if t.type === 'warn'}⚠️{/if}
       </span>
       <span class="message">{t.message}</span>
       <button class="close-btn" on:click={() => toasts.remove(t.id)}>×</button>

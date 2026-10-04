@@ -1,0 +1,65 @@
+name: Validate
+on:
+  pull_request:
+  workflow_call:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci && npm run check && npm run build
+        working-directory: frontend
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.88.0'
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - run: sudo apt-get update && sudo apt-get install -y liblzma-dev libssl-dev pkg-config ansible postgresql-client gnupg openssl
+      - run: cargo fmt --manifest-path backend/Cargo.toml --check
+      - run: cargo test --locked --manifest-path backend/Cargo.toml
+      - run: cargo build --locked --manifest-path backend/Cargo.toml
+      - run: python3 -m unittest discover -s tests -v
+      - run: bash -n install.sh install_in_lxc.sh scripts/backup-manager.sh scripts/restore-manager.sh
+      - run: python3 -m py_compile scripts/update_manager.py
+      - run: ansible-playbook --syntax-check -i localhost, ansible/playbooks/database.yml && ansible-playbook --syntax-check -i localhost, ansible/playbooks/certificate.yml
+        env:
+          ANSIBLE_ROLES_PATH: ansible/roles
+
+      - name: Verify backup encryption and stable CA renewal
+        run: |
+          mkdir -m 700 -p "$RUNNER_TEMP/hostable-gpg-keyring"
+          export GNUPGHOME="$RUNNER_TEMP/hostable-gpg-keyring"
+          export HOSTABLE_DATA_DIR="$RUNNER_TEMP/hostable-crypto-data"
+          export HOSTABLE_BACKUP_DIR="$RUNNER_TEMP/hostable-crypto-backups"
+          export HOSTABLE_TEST_GPG_RECIPIENT='Hostable fixture <fixture@invalid.example>'
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "$HOSTABLE_TEST_GPG_RECIPIENT" rsa2048 encr 1d
+          cargo test --locked --manifest-path backend/Cargo.toml gpg_backup_encryption_materialization_and_integrity -- --ignored
+          cargo test --locked --manifest-path backend/Cargo.toml managed_ca_renewal_keeps_trust_and_constrains_leaf_extensions -- --ignored
+          gpgconf --kill all
+      - name: Start disposable TLS PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/hostable-pg-tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$RUNNER_TEMP/hostable-pg-tls/server.key" -out "$RUNNER_TEMP/hostable-pg-tls/server.crt" -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1
+          sudo chown 999:999 "$RUNNER_TEMP/hostable-pg-tls/server.key"
+          sudo chmod 600 "$RUNNER_TEMP/hostable-pg-tls/server.key"
+          docker run -d --name hostable-test-pg -e POSTGRES_PASSWORD=fixture-password -p 127.0.0.1:5433:5432 -v "$RUNNER_TEMP/hostable-pg-tls:/tls:ro" postgres:16 -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key
+          docker run -d --name hostable-target-pg -e POSTGRES_PASSWORD=fixture-password -p 127.0.0.1:5434:5432 -v "$RUNNER_TEMP/hostable-pg-tls:/tls:ro" postgres:17 -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key
+          for attempt in {1..30}; do if docker exec hostable-test-pg pg_isready -U postgres && docker exec hostable-target-pg pg_isready -U postgres; then exit 0; fi; sleep 1; done
+          docker logs hostable-test-pg; exit 1
+      - name: Verify PostgreSQL isolation, rotation, backup and restore
+        run: cargo test --locked --manifest-path backend/Cargo.toml postgres_roles_rotation_backup_and_verified_restore -- --ignored
+        env:
+          HOSTABLE_TEST_PG_URL: postgresql://postgres:fixture-password@127.0.0.1:5433/postgres
+          HOSTABLE_TEST_PG_TARGET_URL: postgresql://postgres:fixture-password@127.0.0.1:5434/postgres
+          HOSTABLE_TEST_PG_CA: ${{ runner.temp }}/hostable-pg-tls/server.crt
+          HOSTABLE_DATA_DIR: ${{ runner.temp }}/hostable-pg-data
+      - name: Remove disposable PostgreSQL
+        if: always()
+        run: docker rm -f hostable-test-pg hostable-target-pg || true

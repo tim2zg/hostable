@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { apiGet, apiPost, apiDelete } from './api';
+  import { apiGet, apiPost, apiDelete, websocketUrl } from './api';
   import { toasts } from './toast';
   import { Terminal } from 'xterm';
   import { FitAddon } from 'xterm-addon-fit';
@@ -69,7 +69,7 @@
 
   async function startContainer(id: number) {
     try {
-      await apiPost(`/lxc/${id}/start`, {});
+      await apiPost(`/lxcs/${id}/start`, {});
       toasts.add(`Started instance #${id}`, 'success');
       await fetchContainers();
     } catch(e: any) { 
@@ -80,7 +80,7 @@
   async function stopContainer(id: number) {
     if (!confirm(`Are you sure you want to stop container #${id}?`)) return;
     try {
-      await apiPost(`/lxc/${id}/stop`, {});
+      await apiPost(`/lxcs/${id}/stop`, {});
       toasts.add(`Stopped instance #${id}`, 'success');
       await fetchContainers();
     } catch(e: any) { 
@@ -90,7 +90,7 @@
 
   async function restartContainer(id: number) {
     try {
-      await apiPost(`/lxc/${id}/restart`, {});
+      await apiPost(`/lxcs/${id}/restart`, {});
       toasts.add(`Restarted instance #${id}`, 'success');
       await fetchContainers();
     } catch(e: any) { 
@@ -121,7 +121,7 @@
         fitAddon.fit();
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/${id}?token=${localStorage.getItem('hostable_token')}`);
+        ws = new WebSocket(websocketUrl('logs/' + id));
         
         ws.onmessage = (event) => {
           if (xterm) {

@@ -12,15 +12,132 @@ pub enum DbBackend {
 }
 
 impl DbBackend {
+    pub async fn migrate_metadata(&self) -> Result<(), String> {
+        let statements = [
+            "CREATE TABLE IF NOT EXISTS hostable_schema_migrations (version INTEGER PRIMARY KEY)",
+            "CREATE TABLE IF NOT EXISTS hostable_records (kind VARCHAR(32) NOT NULL, id VARCHAR(128) NOT NULL, body TEXT NOT NULL, PRIMARY KEY (kind, id))",
+            "INSERT INTO hostable_schema_migrations (version) VALUES (1) ON CONFLICT (version) DO NOTHING",
+        ];
+        match self {
+            Self::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                for sql in statements {
+                    sqlx::query(sql)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                tx.commit().await.map_err(|e| e.to_string())
+            }
+            Self::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                for sql in statements {
+                    sqlx::query(sql)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                tx.commit().await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    pub async fn put_record(
+        &self,
+        kind: &str,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), String> {
+        let body = body.to_string();
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query("INSERT INTO hostable_records (kind,id,body) VALUES ($1,$2,$3) ON CONFLICT (kind,id) DO UPDATE SET body=EXCLUDED.body").bind(kind).bind(id).bind(body).execute(pool).await.map_err(|e| e.to_string())?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query("INSERT INTO hostable_records (kind,id,body) VALUES (?,?,?) ON CONFLICT (kind,id) DO UPDATE SET body=excluded.body").bind(kind).bind(id).bind(body).execute(pool).await.map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn get_record(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let row: Option<(String,)> = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as("SELECT body FROM hostable_records WHERE kind=$1 AND id=$2")
+                    .bind(kind)
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as("SELECT body FROM hostable_records WHERE kind=? AND id=?")
+                    .bind(kind)
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        row.map(|(body,)| serde_json::from_str(&body).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    pub async fn list_records(&self, kind: &str) -> Result<Vec<serde_json::Value>, String> {
+        let rows: Vec<(String,)> = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as("SELECT body FROM hostable_records WHERE kind=$1 ORDER BY id")
+                    .bind(kind)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as("SELECT body FROM hostable_records WHERE kind=? ORDER BY id")
+                    .bind(kind)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        rows.into_iter()
+            .map(|(body,)| serde_json::from_str(&body).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    pub async fn delete_record(&self, kind: &str, id: &str) -> Result<(), String> {
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query("DELETE FROM hostable_records WHERE kind=$1 AND id=$2")
+                    .bind(kind)
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query("DELETE FROM hostable_records WHERE kind=? AND id=?")
+                    .bind(kind)
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn init(database_url: Option<String>) -> Result<(Self, String), String> {
         let (db_url, is_postgres) = match database_url {
             Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
                 (url, true)
             }
-            Some(url) if url.starts_with("sqlite://") => (url, false),
-            Some(url) if !url.trim().is_empty() => {
-                (format!("sqlite://{}?mode=rwc", url), false)
-            }
+            Some(url) if url.starts_with("sqlite:") => (url, false),
+            Some(url) if !url.trim().is_empty() => (format!("sqlite://{}?mode=rwc", url), false),
             _ => {
                 let default_path = if Path::new("/etc/hostable").is_dir() {
                     "/etc/hostable/hostable.db"
@@ -32,7 +149,7 @@ impl DbBackend {
         };
 
         if is_postgres {
-            tracing::info!("Initializing PostgreSQL database connection ({})", db_url);
+            tracing::info!("Initializing PostgreSQL metadata database");
             let pool = PgPoolOptions::new()
                 .max_connections(5)
                 .connect(&db_url)
@@ -165,13 +282,14 @@ impl DbBackend {
         let hashed = Self::hash_token(raw_token);
         match self {
             DbBackend::Postgres(pool) => {
-                let user: Option<(i32, String)> =
-                    sqlx::query_as("SELECT id, api_token FROM users WHERE api_token = $1 OR api_token = $2")
-                        .bind(&hashed)
-                        .bind(raw_token)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                let user: Option<(i32, String)> = sqlx::query_as(
+                    "SELECT id, api_token FROM users WHERE api_token = $1 OR api_token = $2",
+                )
+                .bind(&hashed)
+                .bind(raw_token)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
 
                 if let Some((id, stored)) = user {
                     if stored == raw_token {
@@ -188,13 +306,14 @@ impl DbBackend {
                 }
             }
             DbBackend::Sqlite(pool) => {
-                let user: Option<(i64, String)> =
-                    sqlx::query_as("SELECT id, api_token FROM users WHERE api_token = ? OR api_token = ?")
-                        .bind(&hashed)
-                        .bind(raw_token)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                let user: Option<(i64, String)> = sqlx::query_as(
+                    "SELECT id, api_token FROM users WHERE api_token = ? OR api_token = ?",
+                )
+                .bind(&hashed)
+                .bind(raw_token)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
 
                 if let Some((id, stored)) = user {
                     if stored == raw_token {
@@ -212,18 +331,26 @@ impl DbBackend {
         }
     }
 
-    pub async fn create_database(&self, name: &str) -> Result<(), String> {
+    pub async fn reset_admin_token(&self) -> Result<String, String> {
+        let raw = format!("hst_{}", Alphanumeric.sample_string(&mut rand::rng(), 64));
+        let hash = Self::hash_token(&raw);
         match self {
-            DbBackend::Postgres(pool) => {
-                let safe_db = name.replace("\"", "").replace("'", "");
-                let q = format!("CREATE DATABASE \"{}\"", safe_db);
-                if let Err(e) = sqlx::query(&q).execute(pool).await {
-                    tracing::warn!("Postgres database creation notice: {}", e);
-                }
-                Ok(())
+            Self::Postgres(pool) => {
+                sqlx::query("UPDATE users SET api_token=$1 WHERE username='admin'")
+                    .bind(&hash)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
-            DbBackend::Sqlite(_) => Ok(()),
+            Self::Sqlite(pool) => {
+                sqlx::query("UPDATE users SET api_token=? WHERE username='admin'")
+                    .bind(&hash)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        Ok(raw)
     }
 
     pub fn engine_name(&self) -> &'static str {
@@ -244,24 +371,34 @@ mod tests {
         let db_path = temp_dir.join(format!("test_hostable_{}.db", rand::random::<u32>()));
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-        let (backend, token) = DbBackend::init(Some(db_url)).await.expect("SQLite init failed");
+        let (backend, token) = DbBackend::init(Some(db_url))
+            .await
+            .expect("SQLite init failed");
         assert_eq!(backend.engine_name(), "Embedded SQLite");
         assert!(token.starts_with("hst_"));
 
         // Verify the token stored in database is hashed, NOT plaintext
         if let DbBackend::Sqlite(pool) = &backend {
-            let (stored_token,): (String,) = sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
-                .fetch_one(pool)
-                .await
-                .expect("fetch stored token failed");
+            let (stored_token,): (String,) =
+                sqlx::query_as("SELECT api_token FROM users WHERE username = 'admin'")
+                    .fetch_one(pool)
+                    .await
+                    .expect("fetch stored token failed");
             assert_ne!(stored_token, token, "Stored token must not be plaintext");
-            assert_eq!(stored_token, DbBackend::hash_token(&token), "Stored token must match SHA-256 hash");
+            assert_eq!(
+                stored_token,
+                DbBackend::hash_token(&token),
+                "Stored token must match SHA-256 hash"
+            );
         }
 
         let valid = backend.verify_token(&token).await.expect("verify failed");
         assert!(valid);
 
-        let invalid = backend.verify_token("wrong_token").await.expect("verify failed");
+        let invalid = backend
+            .verify_token("wrong_token")
+            .await
+            .expect("verify failed");
         assert!(!invalid);
 
         let _ = std::fs::remove_file(db_path);
@@ -296,16 +433,42 @@ mod tests {
         let backend = DbBackend::Sqlite(pool.clone());
 
         // Verification must succeed with the legacy token
-        let valid = backend.verify_token(legacy_token).await.expect("verify legacy failed");
+        let valid = backend
+            .verify_token(legacy_token)
+            .await
+            .expect("verify legacy failed");
         assert!(valid);
 
         // Verification must have migrated the record in-place to SHA-256
-        let (migrated_token,): (String,) = sqlx::query_as("SELECT api_token FROM users WHERE username = 'legacy_user'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let (migrated_token,): (String,) =
+            sqlx::query_as("SELECT api_token FROM users WHERE username = 'legacy_user'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(migrated_token, DbBackend::hash_token(legacy_token));
 
         let _ = std::fs::remove_file(db_path);
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reset_revokes_old_token_and_preserves_metadata() {
+        let (db, old) = DbBackend::init(Some("sqlite::memory:".into()))
+            .await
+            .unwrap();
+        db.migrate_metadata().await.unwrap();
+        db.put_record("container", "101", &serde_json::json!({"name":"existing"}))
+            .await
+            .unwrap();
+        let new = db.reset_admin_token().await.unwrap();
+        assert!(!db.verify_token(&old).await.unwrap());
+        assert!(db.verify_token(&new).await.unwrap());
+        assert_eq!(
+            db.get_record("container", "101").await.unwrap().unwrap()["name"],
+            "existing"
+        );
     }
 }
