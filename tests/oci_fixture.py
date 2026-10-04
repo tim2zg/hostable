@@ -48,7 +48,9 @@ class Registry:
     def __init__(self, directory):
         self.root = pathlib.Path(directory)
         self.root.mkdir()
-        self.ca = self.root / 'registry.crt'
+        self.ca = self.root / 'registry-ca.crt'
+        ca_key = self.root / 'registry-ca.key'
+        certificate = self.root / 'registry.crt'
         key = self.root / 'registry.key'
         openssl = shutil.which('openssl')
         env = os.environ.copy()
@@ -59,14 +61,25 @@ class Registry:
                 env['OPENSSL_CONF'] = r'C:\Program Files\Git\usr\ssl\openssl.cnf'
         if openssl is None:
             raise RuntimeError('OpenSSL is required for the disposable OCI TLS fixture')
-        result = subprocess.run([
-            openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
-            '-keyout', str(key), '-out', str(self.ca), '-subj', '/CN=127.0.0.1',
-            '-addext', 'subjectAltName=IP:127.0.0.1',
-        ], env=env, capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            raise RuntimeError('Cannot generate disposable registry certificate: ' + result.stderr)
+        request = self.root / 'registry.csr'
+        extensions = self.root / 'server-extensions.cnf'
+        extensions.write_text('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n', encoding='utf-8')
+        commands = [
+            ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+             '-keyout', str(ca_key), '-out', str(self.ca), '-subj', '/CN=Hostable fixture CA',
+             '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign'],
+            ['req', '-new', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key),
+             '-out', str(request), '-subj', '/CN=127.0.0.1'],
+            ['x509', '-req', '-in', str(request), '-CA', str(self.ca), '-CAkey', str(ca_key),
+             '-CAcreateserial', '-days', '1', '-extfile', str(extensions), '-out', str(certificate)],
+            ['verify', '-CAfile', str(self.ca), '-purpose', 'sslserver', str(certificate)],
+        ]
+        for command in commands:
+            result = subprocess.run([openssl, *command], env=env, capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                raise RuntimeError('Cannot generate disposable registry certificate: ' + result.stderr)
         key.chmod(0o600)
+        ca_key.chmod(0o600)
         self.blobs = {}
         self.manifests = {}
         self.tags = {}
@@ -74,7 +87,7 @@ class Registry:
         self.requests = []
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(self.ca, key)
+        context.load_cert_chain(certificate, key)
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.server.registry = self
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
